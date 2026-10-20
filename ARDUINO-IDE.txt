@@ -23,8 +23,9 @@ Upload Speed: 921600
 USB Mode: Hardware CDC and JTAG
 Zigbee Mode: Disabled
 
-Libraries, from Library Manager or the libraries folder in this repo:
+Libraries, from the libraries folder in this repo:
 GFX Library for Arduino 1.6.8
 TJpg_Decoder 1.1.0
+ArduinoJson 7.4.2 by Benoit Blanchon. Not Arduino_JSON.
 
 Wi-Fi, HTTP, Update, Preferences, LittleFS, FFat, and Wire come with the ESP32 board package. They are not copied into the libraries folder.

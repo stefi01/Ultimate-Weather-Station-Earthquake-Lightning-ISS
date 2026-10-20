@@ -15,8 +15,11 @@ INSTALL reads `ota/sky_7in.bin`.
 `sketch` is `ultimate_weather.ino`, `usa_map.h`, and `iss_world.h`.
 Open that folder in the Arduino IDE. The folder name matches the sketch name.
 
-`libraries` is GFX Library for Arduino 1.6.8 and TJpg_Decoder 1.1.0.
-Copy both folders into your Arduino libraries folder, or install those same versions from Library Manager.
+`libraries` has three folders.
+GFX Library for Arduino 1.6.8.
+TJpg_Decoder 1.1.0.
+ArduinoJson 7.4.2 by Benoit Blanchon. That is the library kept for these desks. It is not Arduino_JSON.
+Copy those folders into your Arduino libraries folder.
 
 `ARDUINO-IDE.txt` is the Tools menu from the compile that made this firmware.
 
