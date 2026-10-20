@@ -1,0 +1,16 @@
+Ultimate Weather, Waveshare 7 inch.
+
+Repo: https://github.com/stefi01/Ultimate-Weather-Station-Earthquake-Lightning-ISS
+Branch main. Folder ota.
+
+The desk reads only these two files:
+  version.txt
+  sky_7in.bin
+
+version.txt is 1.0. That matches SKY_VER in the sketch.
+CHECK only offers a higher number.
+
+sky_7in.bin is the exported app file ultimate_weather.ino.esp32s3.bin, renamed.
+This copy is the 20 Oct 2026 2:26 PM export. It contains the repo name above.
+
+Arduino settings for that compile are in ARDUINO-IDE.txt.
