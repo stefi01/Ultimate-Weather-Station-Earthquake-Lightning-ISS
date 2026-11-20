@@ -48,7 +48,7 @@
 #define EXIO_SD_CS 4
 #define EXIO_USB_SEL 5
 #define KW 80
-#define SKY_VER "1.0"
+#define SKY_VER "1.2"
 #define SKY_GH_USER "stefi01"
 #define SKY_GH_REPO "Ultimate-Weather-Station-Earthquake-Lightning-ISS"
 #define STRIKE_KM 40.2336f
@@ -107,6 +107,7 @@ struct Launch {
   char day[12];
   char when[8];
   char rocket[28];
+  char site[28];
   char pad[28];
   char agency[16];
 };
@@ -211,6 +212,7 @@ volatile bool otaBusy = false;
 bool otaNewer = false;
 uint32_t lastOtaDraw = 0;
 bool placeSet = false;
+bool zipGo = false;
 float placeLat = 0, placeLon = 0;
 char placeName[40] = "";
 char placeTz[56] = "";
@@ -363,7 +365,11 @@ volatile bool netDone = false;
 volatile int netDoneJob = NET_NONE;
 
 uint32_t lastPack = 0, lastMap = 0, lastIss = 0, lastLaunch = 0, lastTap = 0, lastStrike = 0, lastWind = 0;
+bool eatTouch = false;
 int shownMin = -1;
+bool paintFresh = true;
+bool paintChrome = true;
+bool paintWash = false;
 char packBuf[14336];
 
 void cols() {
@@ -404,11 +410,91 @@ void rightText(const char *s, int right, int y) {
   gfx->print(s);
 }
 
+void fieldLeft(int x, int y, int sz, const char *s, int chars) {
+  char buf[80];
+  if (chars > 78) chars = 78;
+  if (chars < 1) chars = 1;
+  int n = 0;
+  if (s) while (s[n] && n < chars) {
+    buf[n] = s[n];
+    n++;
+  }
+  while (n < chars) buf[n++] = ' ';
+  buf[n] = 0;
+  gfx->setTextSize(sz);
+  gfx->setCursor(x, y);
+  gfx->print(buf);
+}
+
+void fieldRight(int right, int y, int sz, const char *s, int chars) {
+  char buf[80];
+  if (chars > 78) chars = 78;
+  if (chars < 1) chars = 1;
+  int n = 0;
+  if (s) while (s[n] && n < chars) n++;
+  int pad = chars - n;
+  for (int i = 0; i < pad; i++) buf[i] = ' ';
+  if (n && s) memcpy(buf + pad, s, n);
+  buf[chars] = 0;
+  gfx->setTextSize(sz);
+  gfx->setCursor(right - chars * 6 * sz, y);
+  gfx->print(buf);
+}
+
+void fieldCentre(int cx, int y, int sz, const char *s, int chars) {
+  char buf[80];
+  if (chars > 78) chars = 78;
+  if (chars < 1) chars = 1;
+  int n = 0;
+  if (s) while (s[n] && n < chars) n++;
+  int pad = chars - n;
+  int left = pad / 2;
+  int i = 0;
+  for (; i < left; i++) buf[i] = ' ';
+  if (n && s) {
+    memcpy(buf + i, s, n);
+    i += n;
+  }
+  while (i < chars) buf[i++] = ' ';
+  buf[chars] = 0;
+  gfx->setTextSize(sz);
+  gfx->setCursor(cx - (chars * 6 * sz) / 2, y);
+  gfx->print(buf);
+}
+
+void beginPaint(int pg) {
+  static int painted = -1;
+  paintFresh = (painted != pg);
+  painted = pg;
+  if (paintFresh || paintWash) paintChrome = true;
+  page = pg;
+  if (paintFresh || paintWash) gfx->fillScreen(COL_BG);
+}
+
+void endPaint() {
+  paintChrome = false;
+  paintWash = false;
+}
+
+void noteShape(int shape, bool clear) {
+  static int seenPage = -2;
+  static int seen = -2;
+  if (seenPage != page || seen != shape) {
+    if (seenPage == page && !paintFresh && !paintWash) {
+      paintChrome = true;
+      if (clear) gfx->fillScreen(COL_BG);
+    }
+    seenPage = page;
+    seen = shape;
+  }
+}
+
 bool hit(int x, int y, int x0, int y0, int x1, int y1) {
   return x >= x0 && x <= x1 && y >= y0 && y <= y1;
 }
 
 void chip(int x, int y, int w, int h, const char *t, bool on) {
+  if (!paintChrome) return;
   gfx->fillRoundRect(x, y, w, h, 6, on ? COL_HOT : COL_DIM);
   gfx->setTextColor(on ? COL_BG : COL_TXT, on ? COL_HOT : COL_DIM);
   gfx->setTextSize(2);
@@ -466,7 +552,7 @@ void boardIoBegin() {
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
   ch422Write(CH422_WR_SET, 0x01);
   delay(2);
-  ch422Io = (uint8_t)((1u << EXIO_TP_RST) | (1u << EXIO_LCD_RST) | (1u << EXIO_SD_CS));
+  ch422Io = (uint8_t)((1u << EXIO_TP_RST) | (1u << EXIO_SD_CS));
   ch422Flush();
   pinMode(TOUCH_INT, OUTPUT);
   digitalWrite(TOUCH_INT, LOW);
@@ -583,6 +669,7 @@ void loadPrefs() {
     borrowSkyDesk();
     if (wifiSsid[0] || placeSet) savePrefs();
   }
+  if (placeSet) zipGo = true;
   if (blLevel < 0 || blLevel > 2) blLevel = 2;
   tideKnown = tideId[0] != 0;
   applyPlaceTz();
@@ -689,17 +776,20 @@ bool stayIn() {
 }
 
 void drawClockCorner() {
-  gfx->fillRect(548, 0, 252, 48, COL_BG);
-  if (!placeTz[0]) {
+  int mode = !placeTz[0] ? 0 : (!liveClock(nullptr) ? 1 : 2);
+  static int was = -1;
+  if (paintChrome || was != mode) {
+    gfx->fillRect(548, 0, 252, 48, COL_BG);
+    was = mode;
+  }
+  if (mode == 0) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    rightText("place clock", 788, 12);
+    fieldRight(788, 12, 2, "set a place", 14);
     return;
   }
-  if (!liveClock(nullptr)) {
+  if (mode == 1) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    rightText("internet clock", 788, 12);
+    fieldRight(788, 12, 2, "internet clock", 14);
     return;
   }
   time_t now = time(nullptr);
@@ -708,29 +798,31 @@ void drawClockCorner() {
   char line[24];
   fmtHm(t.tm_hour, t.tm_min, line, sizeof(line));
   gfx->setTextColor(COL_TXT, COL_BG);
-  gfx->setTextSize(3);
-  rightText(line, 788, 8);
+  fieldRight(788, 8, 3, line, 8);
   snprintf(line, sizeof(line), "%s %s %d", WDAY[t.tm_wday], MON[t.tm_mon], t.tm_mday);
   gfx->setTextColor(INK, COL_BG);
-  gfx->setTextSize(2);
-  rightText(line, 788, 30);
+  fieldRight(788, 30, 2, line, 16);
   shownMin = t.tm_hour * 60 + t.tm_min;
 }
 
 void drawSunArc(int x, int y, int w, int h) {
-  gfx->fillRoundRect(x, y, w, h, 8, WELL);
-  ticks(x + 6, y + 6, w - 12, h - 12, INK);
+  if (paintChrome) {
+    gfx->fillRoundRect(x, y, w, h, 8, WELL);
+    ticks(x + 6, y + 6, w - 12, h - 12, INK);
+  }
   int cx = x + w / 2;
   int base = y + h - 22;
   int rad = w / 2 - 28;
   int room = h - 70;
   if (rad > room) rad = room;
   if (rad < 36) rad = 36;
-  for (int deg = 0; deg <= 180; deg += 5) {
-    float a = (180 - deg) * (float)M_PI / 180.0f;
-    int px = cx + (int)(cosf(a) * rad);
-    int py = base - (int)(sinf(a) * rad);
-    gfx->fillCircle(px, py, (deg % 30 == 0) ? 3 : 2, INK);
+  if (paintChrome) {
+    for (int deg = 0; deg <= 180; deg += 5) {
+      float a = (180 - deg) * (float)M_PI / 180.0f;
+      int px = cx + (int)(cosf(a) * rad);
+      int py = base - (int)(sinf(a) * rad);
+      gfx->fillCircle(px, py, (deg % 30 == 0) ? 3 : 2, INK);
+    }
   }
   float frac = 0.5f;
   int rh = 0, rm = 0, sh = 0, sm = 0;
@@ -757,7 +849,7 @@ void drawSunArc(int x, int y, int w, int h) {
   bool up = frac > 0.02f && frac < 0.98f;
   bool sunOnArc = true;
   if (rise >= 0 && setm > rise) sunOnArc = nowMin >= rise && nowMin < setm;
-  if (sunOnArc) {
+  if (paintChrome && sunOnArc) {
     gfx->fillCircle(sx, sy, up ? 11 : 7, SUN_C);
     if (up) {
       for (int i = 0; i < 8; i++) {
@@ -769,20 +861,17 @@ void drawSunArc(int x, int y, int w, int h) {
   }
   char line[24];
   gfx->setTextColor(INK, WELL);
-  gfx->setTextSize(2);
   if (wxOk) snprintf(line, sizeof(line), "%.0f W/m2", wxRad);
   else strlcpy(line, "-- W/m2", sizeof(line));
-  gfx->setCursor(x + 14, y + 10);
-  gfx->print(line);
+  fieldLeft(x + 14, y + 10, 2, line, 12);
   if (wxOk) snprintf(line, sizeof(line), "%d UV INDEX", wxUv);
   else strlcpy(line, "-- UV INDEX", sizeof(line));
-  rightText(line, x + w - 14, y + 10);
+  fieldRight(x + w - 14, y + 10, 2, line, 14);
   char foot[16];
   footLabel(wxUp, foot, sizeof(foot));
-  gfx->setCursor(x + 16, base + 2);
-  gfx->print(wxUp[0] ? foot : "-- am");
+  fieldLeft(x + 16, base + 2, 2, wxUp[0] ? foot : "-- am", 8);
   footLabel(wxDown, foot, sizeof(foot));
-  rightText(wxDown[0] ? foot : "-- pm", x + w - 16, base + 2);
+  fieldRight(x + w - 16, base + 2, 2, wxDown[0] ? foot : "-- pm", 8);
 }
 
 void drawPressure(int x, int y, int w, int h) {
@@ -847,40 +936,34 @@ void drawMoonPhase(int cx, int cy, int r, float phase) {
 }
 
 void drawAlertBar() {
-  gfx->fillRoundRect(8, 50, 784, 34, 6, COL_DIM);
-  gfx->setTextSize(2);
-  if (!placeSet) {
-    gfx->setTextColor(COL_MID, COL_DIM);
-    centre("type a US city or ZIP", 400, 58);
-    return;
-  }
-  if (!wifiOk) {
-    gfx->setTextColor(COL_DN, COL_DIM);
-    centre("join wifi", 400, 58);
-    return;
-  }
-  if (alertOn && alertEvent[0]) {
-    char until[40], line[72];
+  if (paintChrome) gfx->fillRoundRect(8, 50, 784, 34, 6, COL_DIM);
+  const char *msg = "waiting";
+  uint16_t ink = COL_MID;
+  char line[72];
+  line[0] = 0;
+  if (!placeSet) msg = "type a US city or ZIP";
+  else if (!wifiOk) {
+    msg = "join wifi";
+    ink = COL_DN;
+  } else if (alertOn && alertEvent[0]) {
+    char until[40];
     formatUntil(alertEnds, until, sizeof(until));
     snprintf(line, sizeof(line), "%s  %s", alertEvent, until);
-    gfx->setTextColor(strstr(alertEvent, "Warning") ? COL_DN : COL_AMB, COL_DIM);
-    centre(line, 400, 58);
-    return;
-  }
-  if (alertLive) {
+    msg = line;
+    ink = strstr(alertEvent, "Warning") ? COL_DN : COL_AMB;
+  } else if (alertLive) {
     const char *sky = wxOk ? skyWord() : "";
     bool openSky = !strcmp(sky, "CLEAR") || !strcmp(sky, "SUN");
     if (stayIn()) {
-      gfx->setTextColor(COL_AMB, COL_DIM);
-      centre("STAY IN", 400, 58);
+      msg = "STAY IN";
+      ink = COL_AMB;
     } else {
-      gfx->setTextColor(COL_UP, COL_DIM);
-      centre(openSky ? "ALL CLEAR" : "NO WARNINGS", 400, 58);
+      msg = openSky ? "ALL CLEAR" : "NO WARNINGS";
+      ink = COL_UP;
     }
-    return;
-  }
-  gfx->setTextColor(COL_MID, COL_DIM);
-  centre(alertNote[0] ? alertNote : "waiting", 400, 58);
+  } else if (alertNote[0]) msg = alertNote;
+  gfx->setTextColor(ink, COL_DIM);
+  fieldCentre(400, 58, 2, msg, 60);
 }
 
 void drawWxCloud(int cx, int cy, uint16_t c) {
@@ -982,10 +1065,13 @@ void drawBolt(int x, int y) {
 }
 
 void drawStrikeChip() {
-  gfx->fillRoundRect(236, 6, 304, 40, 6, COL_DIM);
-  drawBolt(246, 8);
+  if (paintChrome) {
+    gfx->fillRoundRect(236, 6, 304, 40, 6, COL_DIM);
+    drawBolt(246, 8);
+    gfx->setTextColor(SUN_C, COL_DIM);
+    fieldLeft(392, 10, 2, "STRIKES", 8);
+  }
   char line[28];
-  gfx->setTextSize(3);
   if (!placeSet || !strikeLive) {
     gfx->setTextColor(COL_MID, COL_DIM);
     strlcpy(line, "--", sizeof(line));
@@ -993,47 +1079,41 @@ void drawStrikeChip() {
     gfx->setTextColor(strikeCnt > 0 ? COL_AMB : COL_UP, COL_DIM);
     snprintf(line, sizeof(line), "%d", strikeCnt);
   }
-  gfx->setCursor(284, 14);
-  gfx->print(line);
-  gfx->setTextSize(2);
-  gfx->setTextColor(SUN_C, COL_DIM);
-  gfx->setCursor(392, 10);
-  gfx->print("STRIKES");
+  fieldLeft(284, 14, 3, line, 4);
   gfx->setTextColor(COL_TXT, COL_DIM);
   if (strikeLive && strikeCnt > 0 && strikeNearMi >= 0) snprintf(line, sizeof(line), "%d mi", strikeNearMi);
   else strlcpy(line, "--", sizeof(line));
-  gfx->setCursor(392, 26);
-  gfx->print(line);
+  fieldLeft(392, 26, 2, line, 8);
 }
 
 void drawDial(int x, int y, int w, int h, const char *label, const char *big, const char *sub,
               float frac, uint16_t accent, bool compass, int dir) {
-  gfx->fillRoundRect(x, y, w, h, 8, COL_DIM);
-  gfx->setTextColor(accent, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setCursor(x + 8, y + 6);
-  gfx->print(label);
+  if (paintChrome) {
+    gfx->fillRoundRect(x, y, w, h, 8, COL_DIM);
+    gfx->setTextColor(accent, COL_DIM);
+    fieldLeft(x + 8, y + 6, 2, label, 12);
+  }
   int cx = x + w / 2;
   int cy = y + 84;
   if (compass) {
-    gfx->drawCircle(cx, cy, 48, accent);
-    gfx->setTextColor(accent, COL_DIM);
-    centre("N", cx, cy - 42);
+    if (paintChrome) {
+      gfx->drawCircle(cx, cy, 48, accent);
+      gfx->setTextColor(accent, COL_DIM);
+      gfx->setTextSize(2);
+      centre("N", cx, cy - 42);
+      float r = dir * 0.0174533f;
+      gfx->drawLine(cx + (int)(sinf(r) * 28), cy - (int)(cosf(r) * 28),
+                    cx + (int)(sinf(r) * 42), cy - (int)(cosf(r) * 42), SUN_C);
+    }
     gfx->setTextColor(COL_TXT, COL_DIM);
-    gfx->setTextSize(4);
-    centre(big, cx, cy - 16);
-    float r = dir * 0.0174533f;
-    gfx->drawLine(cx + (int)(sinf(r) * 28), cy - (int)(cosf(r) * 28),
-                  cx + (int)(sinf(r) * 42), cy - (int)(cosf(r) * 42), SUN_C);
+    fieldCentre(cx, cy - 16, 4, big, 5);
   } else {
-    gaugeArc(cx, cy, 54, frac, accent);
+    if (paintChrome) gaugeArc(cx, cy, 54, frac, accent);
     gfx->setTextColor(COL_TXT, COL_DIM);
-    gfx->setTextSize(4);
-    centre(big, cx, cy - 16);
+    fieldCentre(cx, cy - 16, 4, big, 5);
   }
-  gfx->setTextSize(2);
   gfx->setTextColor(COL_TXT, COL_DIM);
-  centre(sub, cx, y + h - 22);
+  fieldCentre(cx, y + h - 22, 2, sub, 16);
 }
 
 int homeCardsY() { return showTide ? 328 : 298; }
@@ -1092,38 +1172,33 @@ void drawPressRain() {
   int x = 8 + 3 * 132;
   if (pressHpa > 0) snprintf(val, sizeof(val), "%.2f", pressHpa / 33.8639f);
   else strlcpy(val, "--", sizeof(val));
-  gfx->fillRoundRect(x, 250, 126, 44, 6, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setTextColor(COL_MID, COL_DIM);
-  gfx->setCursor(x + 8, 254);
-  gfx->print("PRESSURE");
+  if (paintChrome) {
+    gfx->fillRoundRect(x, 250, 126, 44, 6, COL_DIM);
+    gfx->setTextColor(COL_MID, COL_DIM);
+    fieldLeft(x + 8, 254, 2, "PRESSURE", 9);
+  }
   gfx->setTextColor(INK, COL_DIM);
-  gfx->setCursor(x + 8, 272);
-  gfx->print(val);
+  fieldLeft(x + 8, 272, 2, val, 8);
   x = 8 + 4 * 132;
   if (wxOk) snprintf(val, sizeof(val), "%.2f", rainToday);
   else strlcpy(val, "--", sizeof(val));
-  gfx->fillRoundRect(x, 250, 126, 44, 6, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setTextColor(COL_MID, COL_DIM);
-  gfx->setCursor(x + 8, 254);
-  gfx->print("RAIN");
+  if (paintChrome) {
+    gfx->fillRoundRect(x, 250, 126, 44, 6, COL_DIM);
+    gfx->setTextColor(COL_MID, COL_DIM);
+    fieldLeft(x + 8, 254, 2, "RAIN", 9);
+  }
   gfx->setTextColor(INK, COL_DIM);
-  gfx->setCursor(x + 8, 272);
-  gfx->print(val);
+  fieldLeft(x + 8, 272, 2, val, 8);
 }
 
 void drawHome() {
-  netHold = false;
-  page = PG_HOME;
+  netHold = !placeSet && !zipGo;
   gfx->setTextWrap(false);
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_HOME);
   char placeLine[18];
   strlcpy(placeLine, placeSet ? placeName : "SET PLACE", sizeof(placeLine));
   gfx->setTextColor(SUN_C, COL_BG);
-  gfx->setTextSize(2);
-  gfx->setCursor(12, 14);
-  gfx->print(placeLine);
+  fieldLeft(12, 14, 2, placeLine, 16);
   drawStrikeChip();
   drawClockCorner();
   drawAlertBar();
@@ -1145,15 +1220,13 @@ void drawHome() {
   float tempFrac = (showDeg(wxTemp) + 10) / 120.0f;
   drawDial(404, 90, 192, 158, useC ? "TEMP C" : "TEMP F", big, sub, tempFrac, tempC, false, 0);
   if (hiS[0]) {
-    int tw = ((int)strlen(hiS) + 2 + (int)strlen(loS)) * 12;
-    int x0 = 404 + (192 - tw) / 2;
-    gfx->setTextSize(2);
     gfx->setTextColor(COL_DN, COL_DIM);
-    gfx->setCursor(x0, 226);
-    gfx->print(hiS);
+    fieldLeft(416, 226, 2, hiS, 8);
     gfx->setTextColor(INK, COL_DIM);
-    gfx->print("  ");
-    gfx->print(loS);
+    fieldLeft(512, 226, 2, loS, 8);
+  } else {
+    gfx->setTextColor(COL_TXT, COL_DIM);
+    fieldLeft(416, 226, 2, "", 16);
   }
 
   if (wxOk) snprintf(big, sizeof(big), "%d%%", wxRh);
@@ -1184,71 +1257,66 @@ void drawHome() {
   sc[5] = COL_DN;
   for (int i = 0; i < 6; i++) {
     int x = 8 + i * 132;
-    gfx->fillRoundRect(x, 250, 126, 44, 6, COL_DIM);
-    gfx->setTextSize(2);
-    gfx->setTextColor(COL_MID, COL_DIM);
-    gfx->setCursor(x + 8, 254);
-    gfx->print(slab[i]);
+    if (paintChrome) {
+      gfx->fillRoundRect(x, 250, 126, 44, 6, COL_DIM);
+      gfx->setTextColor(COL_MID, COL_DIM);
+      fieldLeft(x + 8, 254, 2, slab[i], 9);
+    }
     if (i == 5 && extremeYmd && wxOk) {
       char hi[8], lo[8];
       snprintf(hi, sizeof(hi), "%d", showDeg(dayHot));
       snprintf(lo, sizeof(lo), "%d", showDeg(dayCold));
       gfx->setTextColor(COL_DN, COL_DIM);
-      gfx->setCursor(x + 8, 272);
-      gfx->print(hi);
+      fieldLeft(x + 8, 272, 2, hi, 4);
       gfx->setTextColor(INK, COL_DIM);
-      gfx->setCursor(x + 16 + (int)strlen(hi) * 12, 272);
-      gfx->print(lo);
+      fieldLeft(x + 56, 272, 2, lo, 4);
     } else {
       gfx->setTextColor(sc[i], COL_DIM);
-      gfx->setCursor(x + 8, 272);
-      gfx->print(sval[i]);
+      fieldLeft(x + 8, 272, 2, sval[i], 8);
     }
   }
 
   int cy = homeCardsY();
   int ch = homeCardsH();
-  if (showTide) {
-    gfx->fillRoundRect(8, 298, 784, 26, 6, COL_DIM);
-    gfx->setTextSize(2);
-    gfx->setTextColor(SUN_C, COL_DIM);
-    gfx->setCursor(16, 302);
-    gfx->print("TIDE");
-    gfx->setTextColor(COL_TXT, COL_DIM);
-    gfx->setCursor(90, 302);
-    if (tideHigh[0] && tideLow[0]) {
-      char line[64];
-      snprintf(line, sizeof(line), "%s    %s", tideHigh, tideLow);
-      gfx->print(line);
-    } else if (tideHigh[0])
-      gfx->print(tideHigh);
-    else if (tideLow[0])
-      gfx->print(tideLow);
-    else if (!placeSet)
-      gfx->print("set a place");
-    else if (tideKnown)
-      gfx->print("tide waiting");
-    else if (lastPack)
-      gfx->print("no coast tide");
-    else
-      gfx->print("tide waiting");
-  }
-  gfx->fillRoundRect(8, cy, 250, ch, 8, COL_DIM);
-  gfx->fillRoundRect(266, cy, 268, ch, 8, COL_DIM);
-  gfx->fillRoundRect(542, cy, 250, ch, 8, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setTextColor(SUN_C, COL_DIM);
-  gfx->setCursor(16, cy + 4);
-  gfx->print("QUAKES TODAY");
   int near = quakeNearIndex();
+  int qmode = !quakeOk ? 0 : (near < 0 ? 1 : (ch >= 90 ? 2 : 3));
+  int shape = (showTide ? 1 : 0) + qmode * 4 + (nDays & 7) * 20;
+  shape += (wxOk ? (wxCode % 50) : 0) * 200;
+  if (extremeYmd && wxOk) shape += 7;
+  shape += (localYmd() % 100) * 10000;
+  for (int i = 0; i < nDays && i < 4; i++) shape += (dayCode[i] & 31) * (i + 1);
+  noteShape(shape, false);
+  if (showTide) {
+    char tideLine[64];
+    if (paintChrome) {
+      gfx->fillRoundRect(8, 298, 784, 26, 6, COL_DIM);
+      gfx->setTextColor(SUN_C, COL_DIM);
+      fieldLeft(16, 302, 2, "TIDE", 5);
+    }
+    if (tideHigh[0] && tideLow[0]) snprintf(tideLine, sizeof(tideLine), "%s    %s", tideHigh, tideLow);
+    else if (tideHigh[0]) strlcpy(tideLine, tideHigh, sizeof(tideLine));
+    else if (tideLow[0]) strlcpy(tideLine, tideLow, sizeof(tideLine));
+    else if (!placeSet) strlcpy(tideLine, "set a place", sizeof(tideLine));
+    else if (tideKnown) strlcpy(tideLine, "tide waiting", sizeof(tideLine));
+    else if (lastPack) strlcpy(tideLine, "no coast tide", sizeof(tideLine));
+    else strlcpy(tideLine, "tide waiting", sizeof(tideLine));
+    gfx->setTextColor(COL_TXT, COL_DIM);
+    fieldLeft(90, 302, 2, tideLine, 48);
+  }
+  if (paintChrome) {
+    gfx->fillRoundRect(8, cy, 250, ch, 8, COL_DIM);
+    gfx->fillRoundRect(266, cy, 268, ch, 8, COL_DIM);
+    gfx->fillRoundRect(542, cy, 250, ch, 8, COL_DIM);
+    gfx->setTextColor(SUN_C, COL_DIM);
+    fieldLeft(16, cy + 4, 2, "QUAKES TODAY", 14);
+    fieldLeft(274, cy + 2, 2, "FORECAST", 10);
+  }
   if (!quakeOk) {
     gfx->setTextColor(COL_MID, COL_DIM);
-    gfx->setCursor(16, cy + 28);
-    gfx->print(placeSet ? "loading usgs" : "set a place");
+    fieldLeft(16, cy + 28, 2, placeSet ? "loading usgs" : "set a place", 18);
   } else if (near < 0) {
     gfx->setTextColor(COL_TXT, COL_DIM);
-    gfx->setCursor(16, cy + 28);
-    gfx->print(nQuake ? "none within 75 mi" : "none today");
+    fieldLeft(16, cy + 28, 2, nQuake ? "none within 75 mi" : "none today", 18);
   } else {
     char line[40];
     const Quake &q = quakes[near];
@@ -1256,33 +1324,22 @@ void drawHome() {
     gfx->setTextColor(mc, COL_DIM);
     int miles = quakeMiles(q);
     if (ch >= 90) {
-      gfx->setTextSize(3);
-      gfx->setCursor(16, cy + 26);
       snprintf(line, sizeof(line), "M%.1f", q.mag);
-      gfx->print(line);
-      gfx->setTextSize(2);
+      fieldLeft(16, cy + 26, 3, line, 6);
       gfx->setTextColor(COL_TXT, COL_DIM);
       snprintf(line, sizeof(line), "%d mi", miles);
-      gfx->setCursor(16, cy + 58);
-      gfx->print(line);
+      fieldLeft(16, cy + 58, 2, line, 8);
       snprintf(line, sizeof(line), "%.0f km deep", q.depth);
-      gfx->setCursor(110, cy + 58);
-      gfx->print(line);
+      fieldLeft(110, cy + 58, 2, line, 12);
     } else {
       snprintf(line, sizeof(line), "M%.1f   %d mi", q.mag, miles);
-      gfx->setCursor(16, cy + 24);
-      gfx->print(line);
+      fieldLeft(16, cy + 24, 2, line, 16);
       gfx->setTextColor(COL_TXT, COL_DIM);
       snprintf(line, sizeof(line), "%.0f km deep", q.depth);
-      gfx->setCursor(16, cy + 42);
-      gfx->print(line);
+      fieldLeft(16, cy + 42, 2, line, 14);
     }
   }
 
-  gfx->setTextColor(SUN_C, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setCursor(274, cy + 2);
-  gfx->print("FORECAST");
   int shown = nDays < 4 ? nDays : 4;
   int nameY = cy + 18;
   int iconY = cy + 40;
@@ -1300,59 +1357,44 @@ void drawHome() {
         strlcpy(name, WDAY[t.tm_wday], sizeof(name));
       }
     }
-    gfx->setTextColor(COL_MID, COL_DIM);
-    gfx->setTextSize(2);
-    centre(name, cx, nameY);
-    drawCastIcon(cx, iconY, dayCode[i]);
+    if (paintChrome) {
+      gfx->setTextColor(COL_MID, COL_DIM);
+      fieldCentre(cx, nameY, 2, name, 4);
+      drawCastIcon(cx, iconY, dayCode[i]);
+    }
     char hl[8];
-    gfx->setTextSize(2);
     gfx->setTextColor(COL_DN, COL_DIM);
     snprintf(hl, sizeof(hl), "%d", showDeg(dayHi[i]));
-    centre(hl, cx, hiY);
+    fieldCentre(cx, hiY, 2, hl, 4);
     gfx->setTextColor(INK, COL_DIM);
     snprintf(hl, sizeof(hl), "%d", showDeg(dayLo[i]));
-    centre(hl, cx, loY);
+    fieldCentre(cx, loY, 2, hl, 4);
   }
   if (!shown) {
     gfx->setTextColor(COL_MID, COL_DIM);
-    gfx->setTextSize(2);
-    gfx->setCursor(274, cy + 36);
-    gfx->print("waiting");
+    fieldLeft(274, cy + 36, 2, "waiting", 10);
   }
 
   float phase = 0;
   int pct = 0;
   const char *mn = moonName(&phase, &pct);
-  gfx->setTextSize(2);
+  char line[32];
   if (mn) {
-    drawMoonPhase(564, cy + 16, 10, phase);
+    if (paintChrome) drawMoonPhase(564, cy + 16, 10, phase);
     gfx->setTextColor(SUN_C, COL_DIM);
-    char line[24];
     snprintf(line, sizeof(line), "moon phase %d%%", pct);
-    gfx->setCursor(580, cy + 8);
-    gfx->print(line);
+    fieldLeft(580, cy + 8, 2, line, 16);
   } else {
     gfx->setTextColor(SUN_C, COL_DIM);
-    gfx->setCursor(552, cy + 4);
-    gfx->print("MOON");
+    fieldLeft(552, cy + 4, 2, "MOON", 16);
   }
+  if (wxUp[0]) snprintf(line, sizeof(line), "up %s", wxUp);
+  else strlcpy(line, "sun --", sizeof(line));
   gfx->setTextColor(COL_TXT, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setCursor(552, ch >= 100 ? cy + 40 : cy + 30);
-  if (wxUp[0]) {
-    char line[32];
-    snprintf(line, sizeof(line), "up %s", wxUp);
-    gfx->print(line);
-  } else
-    gfx->print("sun --");
-  gfx->setCursor(552, ch >= 100 ? cy + 62 : cy + 48);
-  if (wxDown[0]) {
-    char line[32];
-    snprintf(line, sizeof(line), "down %s", wxDown);
-    gfx->print(line);
-  }
-  gfx->setTextColor(INK, COL_DIM);
-  gfx->setCursor(552, ch >= 100 ? cy + 86 : cy + 66);
+  fieldLeft(552, ch >= 100 ? cy + 40 : cy + 30, 2, line, 16);
+  if (wxDown[0]) snprintf(line, sizeof(line), "down %s", wxDown);
+  else line[0] = 0;
+  fieldLeft(552, ch >= 100 ? cy + 62 : cy + 48, 2, line, 16);
   if (nRain) {
     int pop = 0;
     float wet = 0;
@@ -1360,25 +1402,26 @@ void drawHome() {
       if ((int)rainPop[i] > pop) pop = (int)rainPop[i];
       wet += rainAmt[i];
     }
-    char line[32];
     snprintf(line, sizeof(line), "6h %d%%  %.2f in", pop, wet);
-    gfx->print(line);
   } else
-    gfx->print("rain --");
+    strlcpy(line, "rain --", sizeof(line));
+  gfx->setTextColor(INK, COL_DIM);
+  fieldLeft(552, ch >= 100 ? cy + 86 : cy + 66, 2, line, 16);
   drawFoot();
+  endPaint();
 }
 
 void drawBack(const char *title) {
   chip(8, 8, 140, 36, "< BACK", false);
   chip(652, 8, 140, 36, "HOME", true);
+  if (!paintChrome) return;
   gfx->setTextColor(SUN_C, COL_BG);
   gfx->setTextSize(2);
   centre(title, 400, 16);
 }
 
 void drawRainPage() {
-  page = PG_RAIN;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_RAIN);
   drawBack("RAIN NEXT 12 HOURS");
   char line[48];
   float sum = 0;
@@ -1388,10 +1431,8 @@ void drawRainPage() {
     if ((int)rainPop[i] > peak) peak = (int)rainPop[i];
   }
   gfx->setTextColor(INK, COL_BG);
-  gfx->setTextSize(2);
   if (nRain) snprintf(line, sizeof(line), "total %.2f in    peak %d%%    today %.2f in", sum, peak, rainToday);
   else strlcpy(line, "waiting for the place", sizeof(line));
-  centre(line, 400, 56);
   int base = 360;
   time_t now;
   int hour0 = 0;
@@ -1405,8 +1446,10 @@ void drawRainPage() {
     int pop = (i < nRain) ? (int)rainPop[i] : 0;
     int bh = pop * 180 / 100;
     uint16_t c = pop >= 70 ? COL_DN : (pop >= 40 ? COL_AMB : INK);
-    if (bh > 0) gfx->fillRect(x, base - bh, 36, bh, c);
-    gfx->drawFastHLine(x, base, 36, COL_MID);
+    if (paintChrome) {
+      if (bh > 0) gfx->fillRect(x, base - bh, 36, bh, c);
+      gfx->drawFastHLine(x, base, 36, COL_MID);
+    }
     gfx->setTextColor(COL_TXT, COL_BG);
     gfx->setTextSize(2);
     int h = (hour0 + i) % 24;
@@ -1419,6 +1462,9 @@ void drawRainPage() {
       centre(hb, x + 18, base - bh - 22);
     }
   }
+  gfx->setTextColor(INK, COL_BG);
+  fieldCentre(400, 56, 2, line, 42);
+  endPaint();
 }
 
 const char *castWord(int c) {
@@ -1459,53 +1505,53 @@ void dayTitle(int ahead, char *out, int n) {
 }
 
 void drawStation() {
-  page = PG_STATION;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_STATION);
   drawBack("WIND AND AIR");
-  gfx->fillRoundRect(12, 64, 380, 390, 8, COL_DIM);
-  gfx->fillRoundRect(408, 64, 380, 390, 8, COL_DIM);
   int cx = 200, cy = 230;
-  gfx->drawCircle(cx, cy, 78, INK);
-  gfx->drawCircle(cx, cy, 4, SUN_C);
-  float r = wxDir * 0.0174533f;
-  gfx->drawLine(cx, cy, cx + (int)(sinf(r) * 68), cy - (int)(cosf(r) * 68), SUN_C);
-  gfx->setTextColor(SUN_C, COL_DIM);
-  gfx->setTextSize(2);
-  centre(lookWord(wxDir), cx, 120);
+  if (paintChrome) {
+    gfx->fillRoundRect(12, 64, 380, 390, 8, COL_DIM);
+    gfx->fillRoundRect(408, 64, 380, 390, 8, COL_DIM);
+    gfx->drawCircle(cx, cy, 78, INK);
+    gfx->drawCircle(cx, cy, 4, SUN_C);
+    float r = wxDir * 0.0174533f;
+    gfx->drawLine(cx, cy, cx + (int)(sinf(r) * 68), cy - (int)(cosf(r) * 68), SUN_C);
+    gfx->setTextColor(SUN_C, COL_DIM);
+    gfx->setTextSize(2);
+    centre(lookWord(wxDir), cx, 120);
+    centre("AIR PRESSURE", 598, 84);
+    gfx->setTextColor(COL_MID, COL_DIM);
+    gfx->setCursor(430, 400);
+    gfx->print("28");
+    gfx->setCursor(680, 400);
+    gfx->print("31");
+    gfx->drawFastHLine(430, 380, 280, INK);
+  }
   char line[32];
-  gfx->setTextSize(3);
   gfx->setTextColor(COL_TXT, COL_DIM);
   snprintf(line, sizeof(line), "%d mph", wxWind);
-  centre(line, cx, 330);
-  gfx->setTextSize(2);
+  fieldCentre(cx, 330, 3, line, 8);
   snprintf(line, sizeof(line), "%d deg", wxDir);
-  centre(line, cx, 370);
+  fieldCentre(cx, 370, 2, line, 8);
   float inHg = pressHpa > 0 ? pressHpa / 33.8639f : 0;
-  gfx->setTextColor(SUN_C, COL_DIM);
-  centre("AIR PRESSURE", 598, 84);
-  gfx->setTextSize(3);
   gfx->setTextColor(COL_TXT, COL_DIM);
   if (inHg > 0) snprintf(line, sizeof(line), "%.2f in", inHg);
   else strlcpy(line, "-- in", sizeof(line));
-  centre(line, 598, 140);
-  gfx->setTextSize(2);
+  fieldCentre(598, 140, 3, line, 8);
   if (pressLo > 0) snprintf(line, sizeof(line), "low  %.2f", pressLo / 33.8639f);
   else strlcpy(line, "low  --", sizeof(line));
-  gfx->setCursor(430, 220);
-  gfx->print(line);
+  gfx->setTextColor(COL_TXT, COL_DIM);
+  fieldLeft(430, 220, 2, line, 14);
   if (pressHi > 0) snprintf(line, sizeof(line), "high  %.2f", pressHi / 33.8639f);
   else strlcpy(line, "high  --", sizeof(line));
-  gfx->setCursor(430, 258);
-  gfx->print(line);
+  fieldLeft(430, 258, 2, line, 14);
+  const char *tr = "";
+  uint16_t tc = COL_MID;
   if (pressTrend > 0) {
-    gfx->setTextColor(COL_UP, COL_DIM);
-    gfx->setCursor(430, 310);
-    gfx->print("rising");
-  } else if (pressTrend == 0 && pressHpa > 0) {
-    gfx->setTextColor(COL_MID, COL_DIM);
-    gfx->setCursor(430, 310);
-    gfx->print("steady");
-  }
+    tr = "rising";
+    tc = COL_UP;
+  } else if (pressTrend == 0 && pressHpa > 0) tr = "steady";
+  gfx->setTextColor(tc, COL_DIM);
+  fieldLeft(430, 310, 2, tr, 8);
   int gauge = 430;
   if (inHg > 0) {
     float t = (inHg - 28.0f) / 3.0f;
@@ -1513,67 +1559,54 @@ void drawStation() {
     if (t > 1) t = 1;
     gauge = 430 + (int)(t * 280);
   }
-  gfx->drawFastHLine(430, 380, 280, INK);
-  gfx->fillCircle(gauge, 380, 8, SUN_C);
-  gfx->setTextColor(COL_MID, COL_DIM);
-  gfx->setCursor(430, 400);
-  gfx->print("28");
-  gfx->setCursor(680, 400);
-  gfx->print("31");
+  if (paintChrome) gfx->fillCircle(gauge, 380, 8, SUN_C);
+  endPaint();
 }
 
 void drawDays() {
-  page = PG_DAYS;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_DAYS);
   drawBack("7 DAY FORECAST");
   if (!nDays) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    centre(wxOk ? "forecast waiting" : "waiting for the sky", 400, 220);
+    fieldCentre(400, 220, 2, wxOk ? "forecast waiting" : "waiting for the sky", 24);
+    endPaint();
     return;
   }
   int rows = nDays > 7 ? 7 : nDays;
+  noteShape(rows, true);
   for (int i = 0; i < rows; i++) {
     int y = 60 + i * 56;
     uint16_t row = (i % 2) ? COL_BG : COL_DIM;
-    gfx->fillRect(12, y, 776, 52, row);
+    if (paintChrome) gfx->fillRect(12, y, 776, 52, row);
     char name[12];
     dayTitle(i, name, sizeof(name));
     gfx->setTextSize(2);
     gfx->setTextColor(SUN_C, row);
-    gfx->setCursor(24, y + 16);
-    gfx->print(name);
+    fieldLeft(24, y + 16, 2, name, 10);
     gfx->setTextColor(COL_TXT, row);
-    gfx->setCursor(180, y + 16);
-    gfx->print(codeWord(dayCode[i]));
+    fieldLeft(180, y + 16, 2, codeWord(dayCode[i]), 14);
     char hi[8], lo[8];
     snprintf(hi, sizeof(hi), "%d", showDeg(dayHi[i]));
     snprintf(lo, sizeof(lo), "%d", showDeg(dayLo[i]));
     gfx->setTextColor(COL_DN, row);
-    gfx->setCursor(400, y + 16);
-    gfx->print(hi);
-    int16_t x1, y1;
-    uint16_t tw, th;
-    gfx->getTextBounds(hi, 400, y + 16, &x1, &y1, &tw, &th);
+    fieldLeft(400, y + 16, 2, hi, 4);
     gfx->setTextColor(RGB565(40, 120, 255), row);
-    gfx->setCursor(400 + (int)tw + 20, y + 16);
-    gfx->print(lo);
+    fieldLeft(468, y + 16, 2, lo, 4);
     char line[16];
     snprintf(line, sizeof(line), "%d%%", dayPop[i]);
     gfx->setTextColor(INK, row);
-    gfx->setCursor(620, y + 16);
-    gfx->print(line);
+    fieldLeft(620, y + 16, 2, line, 4);
   }
+  endPaint();
 }
 
 void drawHours() {
-  page = PG_HOURS;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_HOURS);
   drawBack("NEXT 24 HOURS");
   if (!nSlot) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    centre("waiting for the sky", 400, 220);
+    fieldCentre(400, 220, 2, "waiting for the sky", 24);
+    endPaint();
     return;
   }
   int n = nSlot > 12 ? 12 : nSlot;
@@ -1586,7 +1619,7 @@ void drawHours() {
   struct tm ti;
   if (clock) localtime_r(&now, &ti);
   int baseH = clock ? ti.tm_hour : -1;
-  gfx->drawFastHLine(24, 400, 752, INK);
+  if (paintChrome) gfx->drawFastHLine(24, 400, 752, INK);
   int prevX = -1, prevY = -1;
   for (int i = 0; i < n; i++) {
     int x = 40 + i * (720 / (n > 1 ? n - 1 : 1));
@@ -1600,17 +1633,19 @@ void drawHours() {
       strlcpy(lab, "--", sizeof(lab));
     gfx->setTextSize(2);
     gfx->setTextColor(COL_TXT, COL_BG);
-    centre(lab, x, 64);
+    fieldCentre(x, 64, 2, lab, 5);
     snprintf(lab, sizeof(lab), "%d%s", showDeg(slotT[i]), useC ? "C" : "F");
     gfx->setTextColor(SUN_C, COL_BG);
-    centre(lab, x, 96);
+    fieldCentre(x, 96, 2, lab, 5);
     snprintf(lab, sizeof(lab), "%d%%", slotP[i]);
     gfx->setTextColor(slotP[i] >= 40 ? COL_AMB : INK, COL_BG);
-    centre(lab, x, 128);
+    fieldCentre(x, 128, 2, lab, 4);
     int gy = 400 - slotP[i] * 160 / 100;
     if (gy < 220) gy = 220;
-    if (prevX >= 0) gfx->drawLine(prevX, prevY, x, gy, INK);
-    gfx->fillCircle(x, gy, 3, slotP[i] >= 40 ? COL_AMB : INK);
+    if (paintChrome) {
+      if (prevX >= 0) gfx->drawLine(prevX, prevY, x, gy, INK);
+      gfx->fillCircle(x, gy, 3, slotP[i] >= 40 ? COL_AMB : INK);
+    }
     prevX = x;
     prevY = gy;
   }
@@ -1619,35 +1654,31 @@ void drawHours() {
     gfx->setTextColor(COL_UP, COL_BG);
     centre("no rain", 400, 280);
   }
+  endPaint();
 }
 
 void drawWarn() {
-  page = PG_WARN;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_WARN);
   drawBack("WARNINGS");
   if (!nWarn) {
     gfx->setTextColor(COL_UP, COL_BG);
-    gfx->setTextSize(2);
-    centre("ALL CLEAR", 400, 180);
+    fieldCentre(400, 180, 2, "ALL CLEAR", 12);
   }
   int cards = nWarn > 3 ? 3 : nWarn;
+  noteShape(cards + (auroraKp >= 0 ? 10 : 0), true);
   for (int i = 0; i < cards; i++) {
     int y = 60 + i * 120;
-    gfx->fillRoundRect(16, y, 768, 110, 8, COL_DIM);
-    gfx->setTextSize(2);
+    if (paintChrome) gfx->fillRoundRect(16, y, 768, 110, 8, COL_DIM);
     gfx->setTextColor(strstr(warns[i].event, "Warning") ? COL_DN : SUN_C, COL_DIM);
-    gfx->setCursor(28, y + 10);
-    gfx->print(warns[i].event);
+    fieldLeft(28, y + 10, 2, warns[i].event, 36);
     gfx->setTextColor(COL_TXT, COL_DIM);
-    gfx->setCursor(28, y + 38);
     char brief[42];
     strlcpy(brief, warns[i].headline, sizeof(brief));
-    gfx->print(brief);
+    fieldLeft(28, y + 38, 2, brief, 40);
     char until[40];
     formatUntil(warns[i].ends, until, sizeof(until));
     gfx->setTextColor(COL_MID, COL_DIM);
-    gfx->setCursor(28, y + 72);
-    gfx->print(until);
+    fieldLeft(28, y + 72, 2, until, 36);
   }
   if (auroraKp >= 0 && cards < 3) {
     const char *word = "quiet";
@@ -1656,25 +1687,27 @@ void drawWarn() {
     else if (auroraKp >= 4) word = "unsettled";
     char line[40];
     snprintf(line, sizeof(line), "aurora  Kp %d  %s", auroraKp, word);
-    gfx->setTextSize(2);
     gfx->setTextColor(auroraKp >= 5 ? COL_AMB : COL_MID, COL_BG);
-    centre(line, 400, 430);
+    fieldCentre(400, 430, 2, line, 28);
   }
+  endPaint();
 }
 
 void drawRadar() {
-  page = PG_RADAR;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_RADAR);
   chip(8, 8, 120, 36, "< BACK", false);
   chip(140, 8, 140, 36, "SAT", mapKind == MAP_SAT);
   chip(292, 8, 160, 36, "CLOUDS", mapKind == MAP_CLOUD);
   chip(464, 8, 160, 36, "STORM", mapKind == MAP_STORM);
   chip(652, 8, 140, 36, "HOME", true);
-  gfx->fillRect(0, 52, PW, PH - 52, WELL);
-  gfx->setTextColor(INK, WELL);
-  gfx->setTextSize(2);
-  centre(mapKind == MAP_STORM ? "loading storm picture" : (mapKind == MAP_CLOUD ? "loading cloud picture" : "loading satellite"),
-         400, 220);
+  if (paintChrome) {
+    gfx->fillRect(0, 52, PW, PH - 52, WELL);
+    gfx->setTextColor(INK, WELL);
+    gfx->setTextSize(2);
+    centre(mapKind == MAP_STORM ? "loading storm picture" : (mapKind == MAP_CLOUD ? "loading cloud picture" : "loading satellite"),
+           400, 220);
+  }
+  endPaint();
 }
 
 void paintMapNote() {
@@ -1771,8 +1804,7 @@ bool issJpgPlot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) 
 }
 
 void drawSky() {
-  page = PG_SKY;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_SKY);
   drawBack("SKY");
   const char *sub[4];
   char moon[24], iss[24], suns[24], rock[24];
@@ -1796,27 +1828,30 @@ void drawSky() {
   for (int i = 0; i < 4; i++) {
     int x = 20 + (i % 2) * 390;
     int y = 64 + (i / 2) * 200;
-    gfx->fillRoundRect(x, y, 370, 184, 8, COL_DIM);
-    ticks(x + 10, y + 10, 350, 164, INK);
-    gfx->setTextColor(INK, COL_DIM);
-    gfx->setTextSize(3);
-    centre(title[i], x + 185, y + 58);
+    if (paintChrome) {
+      gfx->fillRoundRect(x, y, 370, 184, 8, COL_DIM);
+      ticks(x + 10, y + 10, 350, 164, INK);
+      gfx->setTextColor(INK, COL_DIM);
+      gfx->setTextSize(3);
+      centre(title[i], x + 185, y + 58);
+    }
     gfx->setTextColor(COL_TXT, COL_DIM);
-    gfx->setTextSize(2);
     if (i == 2 && mn) {
-      drawMoonPhase(x + 64, y + 100, 32, phase);
-      gfx->setTextColor(COL_TXT, COL_DIM);
-      gfx->setTextSize(2);
-      gfx->setCursor(x + 112, y + 78);
-      gfx->print("moon phase");
+      if (paintChrome) {
+        drawMoonPhase(x + 64, y + 100, 32, phase);
+        gfx->setTextColor(COL_TXT, COL_DIM);
+        fieldLeft(x + 112, y + 78, 2, "moon phase", 12);
+      }
       char lit[16];
       snprintf(lit, sizeof(lit), "%d%% lit", pct);
       gfx->setTextColor(INK, COL_DIM);
-      gfx->setCursor(x + 112, y + 106);
-      gfx->print(lit);
-    } else
-      centre(sub[i], x + 185, y + 108);
+      fieldLeft(x + 112, y + 106, 2, lit, 10);
+    } else {
+      gfx->setTextColor(COL_TXT, COL_DIM);
+      fieldCentre(x + 185, y + 108, 2, sub[i], 22);
+    }
   }
+  endPaint();
 }
 
 void drawClockIcon(int cx, int cy, const char *w) {
@@ -1858,13 +1893,12 @@ void drawClockIcon(int cx, int cy, const char *w) {
 }
 
 void drawClockPage() {
-  page = PG_CLOCK;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_CLOCK);
   drawBack("CLOCK");
   if (!liveClock(nullptr) || !placeTz[0]) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    centre(placeTz[0] ? "waiting for live clock" : "place clock", 400, 200);
+    fieldCentre(400, 200, 2, placeTz[0] ? "waiting for live clock" : "set a place", 24);
+    endPaint();
     return;
   }
   time_t now = time(nullptr);
@@ -1874,68 +1908,68 @@ void drawClockPage() {
   int hr = ti.tm_hour > 12 ? ti.tm_hour - 12 : (ti.tm_hour ? ti.tm_hour : 12);
   snprintf(line, sizeof(line), "%d:%02d %s", hr, ti.tm_min, ti.tm_hour >= 12 ? "PM" : "AM");
   gfx->setTextColor(SUN_C, COL_BG);
-  gfx->setTextSize(4);
-  centre(line, 400, 80);
-  gfx->fillRoundRect(40, 160, 340, 80, 6, COL_DIM);
-  gfx->fillRoundRect(420, 160, 340, 80, 6, COL_DIM);
-  gfx->setTextColor(COL_MID, COL_DIM);
-  gfx->setTextSize(2);
-  centre("SUN UP", 210, 172);
-  centre("SUN DOWN", 590, 172);
+  fieldCentre(400, 80, 4, line, 10);
+  if (paintChrome) {
+    gfx->fillRoundRect(40, 160, 340, 80, 6, COL_DIM);
+    gfx->fillRoundRect(420, 160, 340, 80, 6, COL_DIM);
+    gfx->setTextColor(COL_MID, COL_DIM);
+    gfx->setTextSize(2);
+    centre("SUN UP", 210, 172);
+    centre("SUN DOWN", 590, 172);
+  }
   gfx->setTextColor(SUN_C, COL_DIM);
-  gfx->setTextSize(3);
-  centre(wxUp[0] ? wxUp : "--:--", 210, 204);
-  centre(wxDown[0] ? wxDown : "--:--", 590, 204);
+  fieldCentre(210, 204, 3, wxUp[0] ? wxUp : "--:--", 8);
+  fieldCentre(590, 204, 3, wxDown[0] ? wxDown : "--:--", 8);
   gfx->setTextColor(COL_HOT, COL_BG);
-  gfx->setTextSize(2);
-  centre(wxOk ? clockFaceWord() : "waiting", 400, 252);
+  fieldCentre(400, 252, 2, wxOk ? clockFaceWord() : "waiting", 16);
   drawSunArc(16, 278, 768, 188);
+  endPaint();
 }
 
 void drawLaunchCard(int y, const Launch &L) {
-  gfx->fillRoundRect(16, y, PW - 32, 80, 6, COL_DIM);
+  if (paintChrome) gfx->fillRoundRect(16, y, PW - 32, 80, 6, COL_DIM);
   gfx->setTextColor(SUN_C, COL_DIM);
-  gfx->setTextSize(2);
-  char line[56];
+  char line[72];
   snprintf(line, sizeof(line), "WHEN   %s", L.day[0] ? L.day : "----");
-  gfx->setCursor(28, y + 8);
-  gfx->print(line);
+  fieldLeft(28, y + 8, 2, line, 16);
+  gfx->setTextColor(COL_TXT, COL_DIM);
+  fieldRight(PW - 36, y + 8, 2, L.rocket, 18);
   gfx->setTextColor(COL_HOT, COL_DIM);
-  snprintf(line, sizeof(line), "WHERE  %s", L.pad[0] ? L.pad : "----");
-  gfx->setCursor(28, y + 34);
-  gfx->print(line);
+  if (L.site[0] && L.pad[0]) snprintf(line, sizeof(line), "WHERE  %s, %s", L.site, L.pad);
+  else if (L.site[0]) snprintf(line, sizeof(line), "WHERE  %s", L.site);
+  else snprintf(line, sizeof(line), "WHERE  %s", L.pad[0] ? L.pad : "----");
+  fieldLeft(28, y + 34, 2, line, 40);
   gfx->setTextColor(COL_TXT, COL_DIM);
   snprintf(line, sizeof(line), "TIME   %s    %s", L.when[0] ? L.when : "--:--", L.agency);
-  gfx->setCursor(28, y + 58);
-  gfx->print(line);
+  fieldLeft(28, y + 58, 2, line, 40);
 }
 
 void drawLaunchPage() {
-  page = PG_LAUNCH;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_LAUNCH);
   drawBack("LAUNCHES");
   if (!wifiOk || !launchOk) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    centre(liveClock(nullptr) ? "waiting for live launches" : "waiting for live clock", 400, 220);
+    fieldCentre(400, 220, 2, liveClock(nullptr) ? "waiting for live launches" : "waiting for live clock", 28);
+    endPaint();
     return;
   }
   if (!nLaunch) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    centre("no upcoming in the live list", 400, 220);
+    fieldCentre(400, 220, 2, "no upcoming in the live list", 28);
+    endPaint();
     return;
   }
   int y = 56;
+  noteShape(nLaunch, true);
   for (int i = 0; i < nLaunch && i < 4; i++) {
     drawLaunchCard(y, launches[i]);
     y += 86;
   }
+  endPaint();
 }
 
 void drawNight() {
-  page = PG_NIGHT;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_NIGHT);
   drawBack("NIGHT SKY");
   if (!lastAstro || millis() - lastAstro > 1800000UL) computeAstro();
   int pct = 0;
@@ -1960,7 +1994,8 @@ void drawNight() {
   }
   if (!nSkyVis) {
     gfx->setTextColor(COL_MID, COL_BG);
-    centre(liveClock(nullptr) ? "none up tonight" : "waiting for the clock", 400, 220);
+    fieldCentre(400, 220, 2, liveClock(nullptr) ? "none up tonight" : "waiting for the clock", 24);
+    endPaint();
     return;
   }
   int show[6];
@@ -1980,24 +2015,21 @@ void drawNight() {
   for (int k = 0; k < nShow; k++) {
     int i = show[k];
     uint16_t row = (i % 2) ? COL_BG : COL_DIM;
-    gfx->fillRect(12, y, 776, 58, row);
+    if (paintChrome) gfx->fillRect(12, y, 776, 58, row);
     gfx->setTextColor(SUN_C, row);
-    gfx->setCursor(24, y + 8);
-    gfx->print(skyVis[i].name);
+    fieldLeft(24, y + 8, 2, skyVis[i].name, 12);
     gfx->setTextColor(INK, row);
-    gfx->setCursor(180, y + 8);
-    gfx->print(skyVis[i].look);
+    fieldLeft(180, y + 8, 2, skyVis[i].look, 6);
     gfx->setTextColor(COL_TXT, row);
     snprintf(line, sizeof(line), "%s  %d deg", skyVis[i].note, skyVis[i].el);
-    gfx->setCursor(250, y + 8);
-    gfx->print(line);
+    fieldLeft(250, y + 8, 2, line, 18);
     gfx->setTextColor(COL_MID, row);
-    gfx->setCursor(24, y + 32);
-    gfx->print(skyVis[i].hours);
-    if (mn && !strcmp(skyVis[i].name, "Moon")) drawMoonPhase(748, y + 29, 16, phase);
+    fieldLeft(24, y + 32, 2, skyVis[i].hours, 24);
+    if (paintChrome && mn && !strcmp(skyVis[i].name, "Moon")) drawMoonPhase(748, y + 29, 16, phase);
     y += 62;
   }
   if (nOther || nPlanet > 6) chip(470, 8, 160, 36, nightPage ? "PAGE 1" : "PAGE 2", true);
+  endPaint();
 }
 
 int issMapX(float lon) { return (int)((lon + 180.0f) * (PW / 360.0f)); }
@@ -2143,8 +2175,7 @@ void drawEarth() {
 }
 
 void drawIss() {
-  page = PG_ISS;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_ISS);
   drawBack("ISS");
   time_t clockNow = 0;
   bool clockOk = liveClock(&clockNow);
@@ -2157,12 +2188,13 @@ void drawIss() {
     snprintf(clk, sizeof(clk), "%d:%02d %s", hr, ti.tm_min, ti.tm_hour >= 12 ? "PM" : "AM");
     gfx->setTextColor(SUN_C, COL_BG);
     gfx->setTextSize(3);
-    centre(clk, 400, 8);
+    fieldCentre(400, 8, 3, clk, 10);
   }
-  if (!issMapOk) fetchIssMap();
-  drawEarth();
-  updateSunPos();
-  blitIssSunNight();
+  if (paintChrome) {
+    if (!issMapOk) fetchIssMap();
+    drawEarth();
+    updateSunPos();
+    blitIssSunNight();
   const uint16_t path = RGB565(0, 56, 168);
   int px = -999, py = -999;
   for (int i = 0; i < nIssTrack; i++) {
@@ -2191,14 +2223,14 @@ void drawIss() {
     if (placeSet) gfx->fillCircle(issMapX(placeLon), issMapY(placeLat), 4, RGB565(255, 70, 180));
   }
   drawIssSun();
+  }
   time_t now = 0;
   bool soon = false;
   clockOk = liveClock(&now);
   if (clockOk) soon = issNextPass && issNextPass > now && (issNextPass - now) <= 20 * 60;
   if (issVisNow || soon) {
-    gfx->fillRoundRect(16, 72, 300, 36, 4, COL_HOT);
+    if (paintChrome) gfx->fillRoundRect(16, 72, 300, 36, 4, COL_HOT);
     gfx->setTextColor(COL_BG, COL_HOT);
-    gfx->setTextSize(2);
     char look[32];
     if (issVisNow)
       snprintf(look, sizeof(look), "LOOK %s  %ddeg", issLook[0] ? issLook : lookWord(issAz), issEl);
@@ -2207,38 +2239,32 @@ void drawIss() {
       const char *from = nIssPass ? issPasses[0].from : issLook;
       snprintf(look, sizeof(look), "LOOK %s  %d:%02d", from[0] ? from : "?", sec / 60, sec % 60);
     }
-    centre(look, 166, 80);
+    fieldCentre(166, 80, 2, look, 22);
   }
-  gfx->fillRect(0, ISS_Y0 + ISS_H, PW, PH - (ISS_Y0 + ISS_H), COL_BG);
-  gfx->setTextColor(SUN_C, COL_BG);
-  gfx->setTextSize(2);
-  gfx->setCursor(24, 276);
-  gfx->print("VISIBLE PASSES");
-  if (!issTle.ok) {
+  if (paintChrome) {
+    gfx->fillRect(0, ISS_Y0 + ISS_H, PW, PH - (ISS_Y0 + ISS_H), COL_BG);
+    gfx->setTextColor(SUN_C, COL_BG);
+    gfx->setTextSize(2);
+    gfx->setCursor(24, 276);
+    gfx->print("VISIBLE PASSES");
+  }
+  const char *passMsg = "";
+  if (!issTle.ok) passMsg = "waiting for live ISS data";
+  else if (!clockOk) passMsg = "waiting for live clock";
+  else if (!lastPassAt) passMsg = "checking passes";
+  else if (!nIssPass) passMsg = "none in the next 10 days";
+  if (passMsg[0]) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setCursor(24, 320);
-    gfx->print("waiting for live ISS data");
-  } else if (!clockOk) {
-    gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setCursor(24, 320);
-    gfx->print("waiting for live clock");
-  } else if (!lastPassAt) {
-    gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setCursor(24, 320);
-    gfx->print("checking passes");
-  } else if (!nIssPass) {
-    gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setCursor(24, 320);
-    gfx->print("none in the next 10 days");
+    fieldLeft(24, 320, 2, passMsg, 32);
   } else {
     int y = 312;
     for (int i = 0; i < nIssPass && y < 460; i++) {
       gfx->setTextColor(COL_TXT, COL_BG);
-      gfx->setCursor(24, y);
-      gfx->print(issPasses[i].line);
+      fieldLeft(24, y, 2, issPasses[i].line, 48);
       y += 28;
     }
   }
+  endPaint();
 }
 
 int verPack(const char *s) {
@@ -2267,10 +2293,9 @@ void otaNote(const char *s) {
 
 void drawOtaStatus() {
   if (page != PG_ABOUT) return;
-  gfx->fillRect(20, 360, 760, 100, COL_BG);
+  if (paintChrome) gfx->fillRect(20, 360, 760, 100, COL_BG);
   gfx->setTextColor(COL_MID, COL_BG);
-  gfx->setTextSize(2);
-  centre(otaMsg[0] ? otaMsg : "check for updates", 400, 372);
+  fieldCentre(400, 372, 2, otaMsg[0] ? otaMsg : "check for updates", 40);
   if (otaPct >= 0) {
     int w = (720 * constrain(otaPct, 0, 100)) / 100;
     gfx->drawRect(40, 420, 720, 22, COL_DIM);
@@ -2390,8 +2415,7 @@ void askOta(uint8_t kind) {
 }
 
 void drawAbout() {
-  page = PG_ABOUT;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_ABOUT);
   drawBack("ABOUT");
   gfx->setTextColor(COL_TXT, COL_BG);
   gfx->setTextSize(3);
@@ -2401,11 +2425,11 @@ void drawAbout() {
   chip(170, 200, 460, 52, "CHECK FOR UPDATES", false);
   chip(170, 280, 460, 52, "INSTALL", otaNewer);
   drawOtaStatus();
+  endPaint();
 }
 
 void drawSet() {
-  page = PG_SET;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_SET);
   drawBack("SETUP");
   gfx->setTextColor(COL_MID, COL_BG);
   gfx->setTextSize(2);
@@ -2433,9 +2457,11 @@ void drawSet() {
   gfx->print("TEMP");
   chip(160, 424, 180, 44, "F", !useC);
   chip(360, 424, 180, 44, "C", useC);
+  endPaint();
 }
 
 void drawKey(int x, int y, int w, int h, const char *t) {
+  if (!paintChrome) return;
   gfx->fillRoundRect(x, y, w, h, 4, COL_DIM);
   gfx->setTextColor(COL_TXT, COL_DIM);
   gfx->setTextSize(2);
@@ -2522,9 +2548,8 @@ bool hitKeys(int x, int y) {
 
 void drawWifiField(int focus, const char *raw, const char *empty, int y) {
   bool on = wifiFocus == focus;
-  gfx->fillRoundRect(120, y, 664, 40, 6, on ? COL_HOT : COL_DIM);
+  if (paintChrome) gfx->fillRoundRect(120, y, 664, 40, 6, on ? COL_HOT : COL_DIM);
   gfx->setTextColor(on ? COL_BG : COL_TXT, on ? COL_HOT : COL_DIM);
-  gfx->setTextSize(2);
   char shown[40];
   if (!raw[0]) strlcpy(shown, empty, sizeof(shown));
   else {
@@ -2533,8 +2558,7 @@ void drawWifiField(int focus, const char *raw, const char *empty, int y) {
     if (L > 36) p = raw + (L - 36);
     strlcpy(shown, p, sizeof(shown));
   }
-  gfx->setCursor(132, y + 10);
-  gfx->print(shown);
+  fieldLeft(132, y + 10, 2, shown, 36);
 }
 
 void bindWifiKeys() {
@@ -2547,8 +2571,7 @@ void bindWifiKeys() {
 void drawWifi() {
   netHold = true;
   netPend = NET_NONE;
-  page = PG_WIFI;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_WIFI);
   chip(8, 8, 140, 36, "< BACK", false);
   gfx->setTextColor(SUN_C, COL_BG);
   gfx->setTextSize(2);
@@ -2579,23 +2602,21 @@ void drawWifi() {
   chip(8, 436, 252, 36, "SAVE", true);
   chip(274, 436, 252, 36, "RESET WIFI", false);
   chip(540, 436, 252, 36, "FACTORY", false);
+  endPaint();
 }
 
 void drawPlace() {
   netHold = true;
   netPend = NET_NONE;
-  page = PG_PLACE;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_PLACE);
   chip(8, 8, 140, 36, "< BACK", false);
   gfx->setTextColor(SUN_C, COL_BG);
   gfx->setTextSize(2);
   centre("PLACE", 400, 16);
   chip(660, 8, 132, 36, "SEARCH", false);
-  gfx->fillRoundRect(16, 52, 768, 40, 6, COL_DIM);
+  if (paintChrome) gfx->fillRoundRect(16, 52, 768, 40, 6, COL_DIM);
   gfx->setTextColor(COL_TXT, COL_DIM);
-  gfx->setTextSize(2);
-  gfx->setCursor(28, 62);
-  gfx->print(placeQuery[0] ? placeQuery : "city or ZIP");
+  fieldLeft(28, 62, 2, placeQuery[0] ? placeQuery : "city or ZIP", 40);
   chip(8, 100, 56, 88, "<", false);
   chip(736, 100, 56, 88, ">", false);
   if (!nHits) {
@@ -2613,6 +2634,7 @@ void drawPlace() {
   keyShift = &placeShift;
   keySym = &placeSym;
   drawKeys();
+  endPaint();
 }
 
 int httpWaitMs = 12000;
@@ -3715,13 +3737,12 @@ void drawQuakeHead(const char *title) {
 }
 
 void drawQuakeList() {
-  page = PG_QUAKE;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_QUAKE);
   drawQuakeHead("TODAY");
   if (!nQuake) {
     gfx->setTextColor(COL_MID, COL_BG);
-    gfx->setTextSize(2);
-    centre(quakeOk ? "none today" : "loading usgs", 400, 220);
+    fieldCentre(400, 220, 2, quakeOk ? "none today" : "loading usgs", 16);
+    endPaint();
     return;
   }
   if (nQuake <= 8) quakePage = 0;
@@ -3733,34 +3754,30 @@ void drawQuakeList() {
     int i = start + r;
     int y = 48 + r * 46;
     uint16_t row = (i % 2) ? COL_BG : COL_DIM;
-    gfx->fillRect(12, y, 776, 44, row);
+    if (paintChrome) gfx->fillRect(12, y, 776, 44, row);
     char line[80];
     uint16_t mc = quakes[i].mag >= 6 ? COL_DN : (quakes[i].mag >= 5 ? COL_AMB : SUN_C);
-    gfx->setTextSize(3);
     gfx->setTextColor(mc, row);
-    gfx->setCursor(20, y + 8);
     snprintf(line, sizeof(line), "M%.1f", quakes[i].mag);
-    gfx->print(line);
-    gfx->setTextSize(2);
+    fieldLeft(20, y + 8, 3, line, 6);
     gfx->setTextColor(COL_TXT, row);
     char shortp[28];
     strlcpy(shortp, quakes[i].place, sizeof(shortp));
-    gfx->setCursor(150, y + 2);
-    gfx->print(shortp);
+    fieldLeft(150, y + 2, 2, shortp, 26);
     char age[16];
     quakeAge(quakes[i].when, age, sizeof(age));
     int miles = quakeMiles(quakes[i]);
     snprintf(line, sizeof(line), "%d mi   %.0f km deep   %s%s%s", miles, quakes[i].depth, age,
              quakes[i].felt ? "   FELT" : "", quakes[i].tsunami ? "   TSUNAMI" : "");
     gfx->setTextColor(quakes[i].felt || quakes[i].tsunami ? COL_DN : COL_MID, row);
-    gfx->setCursor(150, y + 20);
-    gfx->print(line);
+    fieldLeft(150, y + 20, 2, line, 42);
   }
   if (nQuake > 8) chip(300, 420, 200, 48, quakePage ? "PAGE 1" : "PAGE 2", true);
+  endPaint();
 }
 
 void drawQuakeDetail(int top) {
-  gfx->fillRect(0, top - 4, PW, PH - (top - 4), COL_BG);
+  if (paintChrome) gfx->fillRect(0, top - 4, PW, PH - (top - 4), COL_BG);
   int i = quakePickIndex();
   gfx->setTextSize(2);
   if (i < 0) {
@@ -3848,9 +3865,9 @@ int quakeDotAt(int x, int y) {
 }
 
 void drawQuakeMap() {
-  page = PG_QMAP;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_QMAP);
   drawQuakeHead("TODAY");
+  if (paintChrome) {
   if (!issMapOk) fetchIssMap();
   drawEarth();
   if (placeSet) {
@@ -3889,13 +3906,15 @@ void drawQuakeMap() {
     bool picked = quakePickOn && q.when == quakePickWhen && fabsf(q.lat - quakePickLat) < 0.05f;
     if (picked) gfx->drawCircle(x, y, 11, COL_HOT);
   }
+  }
   drawQuakeDetail(ISS_Y0 + ISS_H + 8);
+  endPaint();
 }
 
 void drawUsaMap() {
-  page = PG_USMAP;
-  gfx->fillScreen(COL_BG);
+  beginPaint(PG_USMAP);
   drawQuakeHead("TODAY");
+  if (paintChrome) {
   jpgClipY = 336;
   TJpgDec.setJpgScale(1);
   TJpgDec.setCallback(jpgPlot);
@@ -3940,7 +3959,9 @@ void drawUsaMap() {
     bool picked = quakePickOn && q.when == quakePickWhen && fabsf(q.lat - quakePickLat) < 0.05f;
     if (picked) gfx->drawCircle(x, y, 11, COL_HOT);
   }
+  }
   drawQuakeDetail(340);
+  endPaint();
 }
 
 void considerStation(const char *win, const char *latp) {
@@ -4293,7 +4314,11 @@ void pullFind() {
            enc);
   nHits = 0;
   char body[3200];
-  if (!httpGetBuf(url, body, sizeof(body), "application/json")) {
+  bool held = netHold;
+  netHold = false;
+  bool got = httpGetBuf(url, body, sizeof(body), "application/json");
+  if (held) netHold = true;
+  if (!got) {
     strlcpy(placeMsg, "search failed", sizeof(placeMsg));
     return;
   }
@@ -5439,7 +5464,7 @@ void pullLaunch() {
       }
     }
     const char *lk = strstr(p, "\"location\":");
-    if (lk && lk < lim) {
+    if (lk && lk < lim && !copyQuoted(lk + 11, lim, locn, sizeof(locn), nullptr)) {
       for (const char *q = lk; q < lim;) {
         const char *ln = strstr(q, "\"name\":");
         if (!ln || ln >= lim) break;
@@ -5452,7 +5477,7 @@ void pullLaunch() {
       }
     }
     const char *pk = strstr(p, "\"pad\":");
-    if (pk && pk < lim) {
+    if (pk && pk < lim && !copyQuoted(pk + 6, lim, padn, sizeof(padn), nullptr)) {
       for (const char *q = pk; q < lim;) {
         const char *pn = strstr(q, "\"name\":");
         if (!pn || pn >= lim) break;
@@ -5495,7 +5520,8 @@ void pullLaunch() {
           strlcpy(L.rocket, name, sizeof(L.rocket));
         if (launchJunk(locn)) locn[0] = 0;
         if (launchJunk(padn)) padn[0] = 0;
-        launchSite(locn, padn, L.pad, sizeof(L.pad));
+        launchSite(locn, padn, L.site, sizeof(L.site));
+        strlcpy(L.pad, padn, sizeof(L.pad));
         strlcpy(L.agency, lsp, sizeof(L.agency));
         nLaunch++;
       }
@@ -5575,12 +5601,16 @@ void takeNetResult() {
   else if (j == NET_QINFO && page == PG_QMAP) drawQuakeMap();
   else if (j == NET_QINFO && page == PG_USMAP) drawUsaMap();
   else if (j == NET_MAP) showMap();
-  else if (j == NET_FIND && page == PG_PLACE) drawPlace();
-  else if (j == NET_LAUNCH && (page == PG_LAUNCH || page == PG_SKY)) {
+  else if (j == NET_FIND && page == PG_PLACE) {
+    paintChrome = true;
+    drawPlace();
+  } else if (j == NET_LAUNCH && (page == PG_LAUNCH || page == PG_SKY)) {
     if (page == PG_LAUNCH) drawLaunchPage();
     else drawSky();
-  } else if (j == NET_OTA && page == PG_ABOUT) drawAbout();
-  else if (j == NET_ISS && (page == PG_ISS || page == PG_SKY)) {
+  } else if (j == NET_OTA && page == PG_ABOUT) {
+    paintChrome = true;
+    drawAbout();
+  } else if (j == NET_ISS && (page == PG_ISS || page == PG_SKY)) {
     if (page == PG_ISS) drawIss();
     else drawSky();
   }
@@ -5652,7 +5682,10 @@ void pollWifiScan() {
   wifiScanTop = 0;
   if (nWifiScan) wifiMsg[0] = 0;
   else strlcpy(wifiMsg, "none found  type name", sizeof(wifiMsg));
-  if (page == PG_WIFI) drawWifi();
+  if (page == PG_WIFI) {
+    paintChrome = true;
+    drawWifi();
+  }
 }
 
 void goHome() { drawHome(); }
@@ -5665,6 +5698,7 @@ void goBack() {
 }
 
 void onTap(int x, int y) {
+  paintChrome = false;
   if (page != PG_HOME && hit(x, y, 652, 8, 792, 44) && page != PG_WIFI && page != PG_PLACE) {
     goHome();
     return;
@@ -5723,6 +5757,7 @@ void onTap(int x, int y) {
   if (page == PG_QUAKE) {
     if (nQuake > 8 && hit(x, y, 300, 420, 500, 468)) {
       quakePage = quakePage ? 0 : 1;
+      paintChrome = true;
       drawQuakeList();
       return;
     }
@@ -5752,8 +5787,13 @@ void onTap(int x, int y) {
       quakePickLat = quakes[i].lat;
       quakePickLon = quakes[i].lon;
       quakePickWhen = quakes[i].when;
-      if (page == PG_QMAP) drawQuakeMap();
-      else drawUsaMap();
+      if (page == PG_QMAP) {
+        paintChrome = true;
+        drawQuakeMap();
+      } else {
+        paintChrome = true;
+        drawUsaMap();
+      }
       if (!quakes[i].infoTried) askNet(NET_QINFO);
     }
     return;
@@ -5763,62 +5803,78 @@ void onTap(int x, int y) {
       dayMode = false;
       cols();
       savePrefs();
+      paintWash = true;
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 360, 78, 540, 122)) {
       dayMode = true;
       cols();
       savePrefs();
+      paintWash = true;
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 160, 148, 300, 192)) {
       blLevel = 0;
       applyBl();
       savePrefs();
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 320, 148, 460, 192)) {
       blLevel = 1;
       applyBl();
       savePrefs();
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 480, 148, 660, 192)) {
       blLevel = 2;
       applyBl();
       savePrefs();
+      paintChrome = true;
       drawSet();
-    } else if (hit(x, y, 668, 148, 788, 192))
+    } else if (hit(x, y, 668, 148, 788, 192)) {
+      paintChrome = true;
       drawAbout();
-    else if (hit(x, y, 160, 196, 340, 236)) {
+    } else if (hit(x, y, 160, 196, 340, 236)) {
       showTide = true;
       savePrefs();
       if (placeSet) askNet(NET_PACK);
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 360, 196, 540, 236)) {
       showTide = false;
       savePrefs();
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 160, 424, 340, 468)) {
       useC = false;
       savePrefs();
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 360, 424, 540, 468)) {
       useC = true;
       savePrefs();
+      paintChrome = true;
       drawSet();
     } else if (hit(x, y, 160, 240, 660, 292)) {
       factoryReset();
       delay(200);
       ESP.restart();
-    } else if (hit(x, y, 160, 360, 660, 412))
+    } else if (hit(x, y, 160, 360, 660, 412)) {
+      paintChrome = true;
       drawWifi();
+    }
     return;
   }
   if (page == PG_ABOUT) {
     if (otaBusy) return;
     if (hit(x, y, 170, 200, 630, 252)) {
       askOta(1);
+      paintChrome = true;
       drawAbout();
     } else if (hit(x, y, 170, 280, 630, 332)) {
       if (!otaNewer) otaNote("check for updates");
       else askOta(2);
+      paintChrome = true;
       drawAbout();
     }
     return;
@@ -5847,6 +5903,7 @@ void onTap(int x, int y) {
       }
       if (nOther || nPlanet > 6) {
         nightPage = nightPage ? 0 : 1;
+        paintChrome = true;
         drawNight();
       }
     }
@@ -5863,6 +5920,7 @@ void onTap(int x, int y) {
     else if (hit(x, y, 464, 8, 624, 44)) next = MAP_STORM;
     if (next >= 0 && next != mapKind) {
       mapKind = next;
+      paintChrome = true;
       drawRadar();
       askNet(NET_MAP);
     }
@@ -5874,7 +5932,10 @@ void onTap(int x, int y) {
       return;
     }
     if (hit(x, y, 660, 8, 792, 44)) {
+      if (!placeQuery[0]) return;
+      zipGo = true;
       strlcpy(placeMsg, "searching", sizeof(placeMsg));
+      paintChrome = true;
       drawPlace();
       dlBurst = 1;
       askNet(NET_FIND);
@@ -5882,11 +5943,13 @@ void onTap(int x, int y) {
     }
     if (hit(x, y, 8, 100, 64, 188)) {
       if (placeTop >= 2) placeTop -= 2;
+      paintChrome = true;
       drawPlace();
       return;
     }
     if (hit(x, y, 736, 100, 792, 188)) {
       if (placeTop + 2 < nHits) placeTop += 2;
+      paintChrome = true;
       drawPlace();
       return;
     }
@@ -5902,7 +5965,10 @@ void onTap(int x, int y) {
     keyCap = (int)sizeof(placeQuery);
     keyShift = &placeShift;
     keySym = &placeSym;
-    if (hitKeys(x, y)) drawPlace();
+    if (hitKeys(x, y)) {
+      paintChrome = true;
+      drawPlace();
+    }
     return;
   }
   if (page != PG_WIFI) return;
@@ -5912,16 +5978,19 @@ void onTap(int x, int y) {
   }
   if (hit(x, y, 660, 8, 792, 44)) {
     startWifiScan();
+    paintChrome = true;
     drawWifi();
     return;
   }
   if (hit(x, y, 8, 52, 64, 88)) {
     if (wifiScanTop > 0) wifiScanTop--;
+    paintChrome = true;
     drawWifi();
     return;
   }
   if (hit(x, y, 736, 52, 792, 88)) {
     if (wifiScanTop + 2 < nWifiScan) wifiScanTop++;
+    paintChrome = true;
     drawWifi();
     return;
   }
@@ -5930,17 +5999,20 @@ void onTap(int x, int y) {
     if (idx < nWifiScan && hit(x, y, 72 + i * 328, 52, 392 + i * 328, 88)) {
       strlcpy(wifiSsid, wifiScan[idx], sizeof(wifiSsid));
       wifiFocus = 1;
+      paintChrome = true;
       drawWifi();
       return;
     }
   }
   if (hit(x, y, 120, 100, 784, 140)) {
     wifiFocus = 0;
+    paintChrome = true;
     drawWifi();
     return;
   }
   if (hit(x, y, 120, 148, 784, 188)) {
     wifiFocus = 1;
+    paintChrome = true;
     drawWifi();
     return;
   }
@@ -5959,14 +6031,17 @@ void onTap(int x, int y) {
       if (placeSet) askNet(NET_PACK);
     } else {
       strlcpy(wifiMsg, "no join", sizeof(wifiMsg));
+      paintChrome = true;
       drawWifi();
     }
+    eatTouch = true;
     return;
   }
   if (hit(x, y, 274, 436, 526, 472)) {
     wifiSsid[0] = wifiPass[0] = 0;
     WiFi.disconnect(true, true);
     savePrefs();
+    paintChrome = true;
     drawWifi();
     return;
   }
@@ -5977,7 +6052,10 @@ void onTap(int x, int y) {
     return;
   }
   bindWifiKeys();
-  if (hitKeys(x, y)) drawWifi();
+  if (hitKeys(x, y)) {
+    paintChrome = true;
+    drawWifi();
+  }
 }
 
 int gt911Touches(int *xs, int *ys, int maxN) {
@@ -6067,6 +6145,9 @@ void setup() {
     Serial.println("gfx begin failed");
     return;
   }
+  delay(10);
+  ch422Bit(EXIO_LCD_RST, true);
+  delay(120);
   gfx->setTextWrap(false);
   cols();
   applyBl();
@@ -6079,7 +6160,10 @@ void loop() {
   pollWifiScan();
   int x, y;
   int nTouch = gt911Touches(&x, &y, 1);
-  if (nTouch == 1 && millis() - lastTap > 160) {
+  if (eatTouch) {
+    if (nTouch == 0) eatTouch = false;
+    lastTap = millis();
+  } else if (nTouch == 1 && millis() - lastTap > 160) {
     lastTap = millis();
     onTap(x, y);
   }
@@ -6120,11 +6204,12 @@ void loop() {
       int m = t.tm_hour * 60 + t.tm_min;
       if (m != shownMin) {
         drawClockCorner();
-        drawStrikeChip();
+        if (!placeTz[0]) shownMin = m;
+        if (placeSet && zipGo) drawStrikeChip();
       }
     }
   }
-  if (wifiOk && placeSet && !netBusy && !netJob) {
+  if (wifiOk && placeSet && zipGo && !netBusy && !netJob) {
     if (!lastWind || millis() - lastWind > 30000UL) askNet(NET_WIND);
     else if (!lastStrike || millis() - lastStrike > 30000UL) askNet(NET_STRIKE);
     else if (!lastPack || millis() - lastPack > 300000UL) askNet(NET_PACK);

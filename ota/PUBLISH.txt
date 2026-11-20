@@ -7,10 +7,10 @@ The desk reads only these two files:
   version.txt
   sky_7in.bin
 
-version.txt is 1.0. That matches SKY_VER in the sketch.
+version.txt is 1.2. That matches SKY_VER in the sketch.
 CHECK only offers a higher number.
 
 sky_7in.bin is the exported app file ultimate_weather.ino.esp32s3.bin, renamed.
-This copy is the 20 Oct 2026 2:26 PM export. It contains the repo name above.
+This copy is the 20 Nov 2026 4:12 AM export. It contains the repo name above.
 
 Arduino settings for that compile are in ARDUINO-IDE.txt.

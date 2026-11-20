@@ -4,7 +4,7 @@
 
 Board: Waveshare ESP32-S3-Touch-LCD-7, 800 by 480.
 
-Version on the desk: 1.0
+Version on the desk: 1.2
 
 ## Folders
 
@@ -31,7 +31,7 @@ SET, then ABOUT, then CHECK FOR UPDATES.
 If `ota/version.txt` is a higher number than the version on the desk, tap INSTALL.
 Leave the desk plugged in until it restarts.
 
-A desk already on 1.0 says the newest firmware is already installed.
+A desk already on 1.2 says the newest firmware is already installed.
 Raise the version in the sketch and in `ota/version.txt` together when you ship a newer bin.
 
 The desk looks at this repo:
