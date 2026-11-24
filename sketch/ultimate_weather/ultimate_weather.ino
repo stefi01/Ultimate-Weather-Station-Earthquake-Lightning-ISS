@@ -1,4 +1,5 @@
-/*
+
+ /*
   Ultimate weather — Waveshare ESP32-S3-Touch-LCD-7, 800x480.
   Sky pages from the 7 inch desk, storm alerts on the home bar,
   USGS quakes from the quake desk. Own prefs name ultwx.
@@ -48,7 +49,7 @@
 #define EXIO_SD_CS 4
 #define EXIO_USB_SEL 5
 #define KW 80
-#define SKY_VER "1.2"
+#define SKY_VER "1.3"
 #define SKY_GH_USER "stefi01"
 #define SKY_GH_REPO "Ultimate-Weather-Station-Earthquake-Lightning-ISS"
 #define STRIKE_KM 40.2336f
@@ -187,9 +188,9 @@ static const ZoneRow ZONES[] = {
 static const char *MON[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 static const char *WDAY[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
-static const uint16_t INK = RGB565(80, 220, 255);
-static const uint16_t SUN_C = RGB565(255, 210, 40);
-static const uint16_t WELL = RGB565(0, 0, 0);
+static uint16_t INK = 0;
+static uint16_t SUN_C = 0;
+static uint16_t WELL = 0;
 
 Arduino_ESP32RGBPanel *rgbBus = nullptr;
 uint8_t ch422Io = 0;
@@ -275,7 +276,7 @@ bool alertLive = false, alertOn = false;
 char alertEvent[48] = "";
 char alertEnds[40] = "";
 char alertDetail[80] = "";
-char alertNote[24] = "set a place";
+char alertNote[24] = "";
 
 char tideId[12] = "";
 char tideName[24] = "";
@@ -335,6 +336,8 @@ uint8_t *mapHold = nullptr;
 uint8_t *mapRadar = nullptr;
 int mapHoldLen = 0;
 int mapRadarLen = 0;
+uint16_t *mapSheet = nullptr;
+int mapStamp = 0;
 bool mapFail = false;
 struct MapTown {
   char name[24];
@@ -363,6 +366,7 @@ volatile bool netBusy = false;
 volatile bool netHold = false;
 volatile bool netDone = false;
 volatile int netDoneJob = NET_NONE;
+volatile bool wxPaint = false;
 
 uint32_t lastPack = 0, lastMap = 0, lastIss = 0, lastLaunch = 0, lastTap = 0, lastStrike = 0, lastWind = 0;
 bool eatTouch = false;
@@ -371,6 +375,39 @@ bool paintFresh = true;
 bool paintChrome = true;
 bool paintWash = false;
 char packBuf[14336];
+
+int shadeNum() {
+  if (blLevel <= 0) return 5;
+  if (blLevel == 1) return 6;
+  return 8;
+}
+
+uint16_t shade565(uint16_t c) {
+  int num = shadeNum();
+  if (num >= 8) return c;
+  int r = ((c >> 11) & 31) * num / 8;
+  int g = ((c >> 5) & 63) * num / 8;
+  int b = (c & 31) * num / 8;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+#undef RGB565
+#define RGB565(r, g, b) shade565((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
+
+void paintBits(int16_t x, int16_t y, uint16_t *bitmap, uint16_t w, uint16_t h) {
+  if (!gfx || !bitmap || w < 1 || h < 1) return;
+  if (shadeNum() >= 8) {
+    gfx->draw16bitRGBBitmap(x, y, bitmap, w, h);
+    return;
+  }
+  static uint16_t line[800];
+  if (w > 800) w = 800;
+  for (uint16_t row = 0; row < h; row++) {
+    uint16_t *src = bitmap + (uint32_t)row * w;
+    for (uint16_t i = 0; i < w; i++) line[i] = shade565(src[i]);
+    gfx->draw16bitRGBBitmap(x, y + row, line, w, 1);
+  }
+}
 
 void cols() {
   if (dayMode) {
@@ -392,6 +429,9 @@ void cols() {
     COL_DN = RGB565(230, 60, 70);
     COL_AMB = RGB565(255, 170, 40);
   }
+  INK = RGB565(80, 220, 255);
+  SUN_C = RGB565(255, 210, 40);
+  WELL = RGB565(0, 0, 0);
 }
 
 void centre(const char *s, int cx, int y) {
@@ -548,11 +588,18 @@ void ch422Bit(int bit, bool on) {
   Wire.endTransmission();
 }
 
+void lcdResetPulse() {
+  ch422Bit(EXIO_LCD_RST, false);
+  delay(20);
+  ch422Bit(EXIO_LCD_RST, true);
+  delay(120);
+}
+
 void boardIoBegin() {
   Wire.begin(TOUCH_SDA, TOUCH_SCL);
   ch422Write(CH422_WR_SET, 0x01);
   delay(2);
-  ch422Io = (uint8_t)((1u << EXIO_TP_RST) | (1u << EXIO_SD_CS));
+  ch422Io = (uint8_t)((1u << EXIO_TP_RST) | (1u << EXIO_LCD_RST) | (1u << EXIO_LCD_BL) | (1u << EXIO_SD_CS));
   ch422Flush();
   pinMode(TOUCH_INT, OUTPUT);
   digitalWrite(TOUCH_INT, LOW);
@@ -561,35 +608,14 @@ void boardIoBegin() {
   ch422Bit(EXIO_TP_RST, true);
   delay(50);
   pinMode(TOUCH_INT, INPUT);
-}
-
-volatile int blDuty = 10;
-TaskHandle_t blTask = nullptr;
-
-void blPwm(void *) {
-  for (;;) {
-    int duty = blDuty;
-    if (duty >= 10) {
-      ch422Bit(EXIO_LCD_BL, true);
-      vTaskDelay(pdMS_TO_TICKS(20));
-      continue;
-    }
-    if (duty < 1) duty = 1;
-    ch422Bit(EXIO_LCD_BL, true);
-    vTaskDelay(pdMS_TO_TICKS(duty));
-    if (blDuty >= 10) continue;
-    ch422Bit(EXIO_LCD_BL, false);
-    vTaskDelay(pdMS_TO_TICKS(10 - duty));
-  }
+  lcdResetPulse();
+  lcdResetPulse();
 }
 
 void applyBl() {
   if (!i2cLock) i2cLock = xSemaphoreCreateMutex();
-  if (blLevel <= 0) blDuty = 3;
-  else if (blLevel == 1) blDuty = 6;
-  else blDuty = 10;
-  if (blDuty >= 10) ch422Bit(EXIO_LCD_BL, true);
-  if (!blTask) xTaskCreatePinnedToCore(blPwm, "blpwm", 4096, nullptr, 2, &blTask, 0);
+  ch422Bit(EXIO_LCD_BL, true);
+  cols();
 }
 
 int showDeg(int f) {
@@ -1720,15 +1746,13 @@ void paintMapNote() {
 }
 
 bool cloudBright(uint16_t p) {
-  int r = (p >> 11) & 31;
-  int g = (p >> 5) & 63;
-  int b = p & 31;
-  if (g < 36 || r < 16 || b < 16) return false;
-  int rg = r * 2 - g;
-  if (rg < 0) rg = -rg;
-  int gb = g - b * 2;
-  if (gb < 0) gb = -gb;
-  return rg < 16 && gb < 18;
+  int r = ((p >> 11) & 31) * 8;
+  int g = ((p >> 5) & 63) * 4;
+  int b = (p & 31) * 8;
+  if (b > r + 25 && b > g + 10) return false;
+  if (r > 140 && g > 140 && b > 140) return true;
+  if (r > 110 && b > 90 && r > g + 15) return true;
+  return false;
 }
 
 bool cloudOverPlot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
@@ -1741,7 +1765,7 @@ bool cloudOverPlot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitma
       while (i < w && (x + i < 0 || x + i >= PW || !cloudBright(bitmap[j * w + i]))) i++;
       uint16_t start = i;
       while (i < w && x + i >= 0 && x + i < PW && cloudBright(bitmap[j * w + i])) i++;
-      if (i > start) gfx->draw16bitRGBBitmap(x + start, yy, bitmap + j * w + start, i - start, 1);
+      if (i > start) paintBits(x + start, yy, bitmap + j * w + start, i - start, 1);
     }
   }
   return 1;
@@ -1752,7 +1776,7 @@ bool jpgPlot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
   int hh = h;
   if (y + hh > jpgClipY) hh = jpgClipY - y;
   if (hh <= 0 || x >= PW) return 1;
-  gfx->draw16bitRGBBitmap(x, y, bitmap, w, hh);
+  paintBits(x, y, bitmap, w, hh);
   return 1;
 }
 
@@ -1780,11 +1804,11 @@ bool radarPlot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
       bool hot = (x + (int)i) >= 0 && (x + (int)i) < PW && radarColor(bitmap[j * w + i]);
       if (hot && run < 0) run = i;
       if (!hot && run >= 0) {
-        gfx->draw16bitRGBBitmap(x + run, yy, bitmap + j * w + run, i - run, 1);
+        paintBits(x + run, yy, bitmap + j * w + run, i - run, 1);
         run = -1;
       }
     }
-    if (run >= 0) gfx->draw16bitRGBBitmap(x + run, yy, bitmap + j * w + run, w - run, 1);
+    if (run >= 0) paintBits(x + run, yy, bitmap + j * w + run, w - run, 1);
   }
   return 1;
 }
@@ -2142,7 +2166,7 @@ void blitIssSunNight() {
   for (int y = 0; y < ISS_H; y += 20) {
     int rows = 20;
     if (y + rows > ISS_H) rows = ISS_H - y;
-    gfx->draw16bitRGBBitmap(0, ISS_Y0 + y, issShade + y * PW, PW, rows);
+    paintBits(0, ISS_Y0 + y, issShade + y * PW, PW, rows);
     delay(0);
   }
 }
@@ -2152,7 +2176,7 @@ void drawEarth() {
     for (int y = 0; y < ISS_H; y += 20) {
       int rows = 20;
       if (y + rows > ISS_H) rows = ISS_H - y;
-      gfx->draw16bitRGBBitmap(0, ISS_Y0 + y, issFb + y * PW, PW, rows);
+      paintBits(0, ISS_Y0 + y, issFb + y * PW, PW, rows);
       delay(0);
     }
     return;
@@ -4248,6 +4272,7 @@ bool pullWind(float lat, float lon) {
 
 void pullPack(float lat, float lon) {
   bool met = pullMeteo(lat, lon);
+  if (met && lat == placeLat && lon == placeLon) wxPaint = true;
   if (lat != placeLat || lon != placeLon) return;
   if (!met) {
     if (!wxOk) strlcpy(alertNote, "no sky link", sizeof(alertNote));
@@ -4674,6 +4699,62 @@ void paintMapCities() {
   }
 }
 
+bool mapSheetPlot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *bitmap) {
+  if (!mapSheet || !bitmap) return 0;
+  for (uint16_t j = 0; j < h; j++) {
+    int yy = y + j;
+    if (yy < 0 || yy >= 420) continue;
+    for (uint16_t i = 0; i < w; i++) {
+      int xx = x + i;
+      if (xx < 0 || xx >= 800) continue;
+      uint16_t p = bitmap[j * w + i];
+      if (mapStamp == 1) {
+        int r = ((p >> 11) & 31) * 8;
+        int g = ((p >> 5) & 63) * 4;
+        int b = (p & 31) * 8;
+        int mx = r;
+        int mn = r;
+        if (g > mx) mx = g;
+        if (b > mx) mx = b;
+        if (g < mn) mn = g;
+        if (b < mn) mn = b;
+        if (mn <= 150 || mx - mn >= 45) continue;
+        int a = mn - 150;
+        if (a < 37) a = 37;
+        if (a > 89) a = 89;
+        uint16_t base = mapSheet[yy * 800 + xx];
+        int br = ((base >> 11) & 31) * 8;
+        int bg = ((base >> 5) & 63) * 4;
+        int bb = (base & 31) * 8;
+        int rr = (br * (105 - a) + 245 * a) / 105;
+        int gg = (bg * (105 - a) + 245 * a) / 105;
+        int bw = (bb * (105 - a) + 250 * a) / 105;
+        mapSheet[yy * 800 + xx] = (uint16_t)(((rr >> 3) << 11) | ((gg >> 2) << 5) | (bw >> 3));
+        continue;
+      }
+      if (mapStamp == 2 && !radarColor(p)) continue;
+      mapSheet[yy * 800 + xx] = p;
+    }
+  }
+  return 1;
+}
+
+bool ensureMapSheet() {
+  if (mapSheet) return true;
+  mapSheet = (uint16_t *)ps_malloc((size_t)800 * 420 * 2);
+  return mapSheet != nullptr;
+}
+
+void blitMapSheet() {
+  int rows = 420;
+  if (56 + rows > jpgClipY) rows = jpgClipY - 56;
+  if (rows < 1) return;
+  for (int y = 0; y < rows; y++) {
+    paintBits(0, 56 + y, mapSheet + y * 800, 800, 1);
+    if ((y & 7) == 7) delay(1);
+  }
+}
+
 void showMap() {
   if (page != PG_RADAR) {
     if (mapHold) {
@@ -4697,19 +4778,40 @@ void showMap() {
   jpgOx = 0;
   jpgOy = 56;
   jpgClipY = 470;
-  TJpgDec.setJpgScale(1);
-  TJpgDec.setCallback(jpgPlot);
-  TJpgDec.setSwapBytes(false);
-  int rc = TJpgDec.drawJpg(jpgOx, jpgOy, mapHold, mapHoldLen);
-  if (rc == 0 && mapKind == MAP_CLOUD && mapRadar && mapRadarLen > 400) {
-    TJpgDec.setCallback(cloudOverPlot);
-    TJpgDec.drawJpg(jpgOx, jpgOy, mapRadar, mapRadarLen);
+  int rc = 1;
+  if (ensureMapSheet()) {
+    for (int i = 0; i < 800 * 420; i++) mapSheet[i] = 0;
+    mapStamp = 0;
+    TJpgDec.setJpgScale(1);
+    TJpgDec.setCallback(mapSheetPlot);
+    TJpgDec.setSwapBytes(false);
+    rc = TJpgDec.drawJpg(0, 0, mapHold, mapHoldLen);
+    if (rc == 0 && mapKind == MAP_CLOUD && mapRadar && mapRadarLen > 400) {
+      mapStamp = 1;
+      TJpgDec.drawJpg(0, 0, mapRadar, mapRadarLen);
+    }
+    if (rc == 0 && mapKind == MAP_STORM && mapRadar && mapRadarLen > 400) {
+      mapStamp = 2;
+      TJpgDec.drawJpg(0, 0, mapRadar, mapRadarLen);
+    }
+    mapStamp = 0;
     TJpgDec.setCallback(jpgPlot);
-  }
-  if (rc == 0 && mapKind == MAP_STORM && mapRadar && mapRadarLen > 400) {
-    TJpgDec.setCallback(radarPlot);
-    TJpgDec.drawJpg(jpgOx, jpgOy, mapRadar, mapRadarLen);
+    if (rc == 0) blitMapSheet();
+  } else {
+    TJpgDec.setJpgScale(1);
     TJpgDec.setCallback(jpgPlot);
+    TJpgDec.setSwapBytes(false);
+    rc = TJpgDec.drawJpg(jpgOx, jpgOy, mapHold, mapHoldLen);
+    if (rc == 0 && mapKind == MAP_CLOUD && mapRadar && mapRadarLen > 400) {
+      TJpgDec.setCallback(cloudOverPlot);
+      TJpgDec.drawJpg(jpgOx, jpgOy, mapRadar, mapRadarLen);
+      TJpgDec.setCallback(jpgPlot);
+    }
+    if (rc == 0 && mapKind == MAP_STORM && mapRadar && mapRadarLen > 400) {
+      TJpgDec.setCallback(radarPlot);
+      TJpgDec.drawJpg(jpgOx, jpgOy, mapRadar, mapRadarLen);
+      TJpgDec.setCallback(jpgPlot);
+    }
   }
   free(mapHold);
   mapHold = nullptr;
@@ -5650,8 +5752,8 @@ void choosePlace(int idx) {
   nQDots = 0;
   strlcpy(alertNote, "waiting", sizeof(alertNote));
   savePrefs();
-  drawHome();
-  askNet(NET_PACK);
+  delay(200);
+  ESP.restart();
 }
 
 void startWifiScan() {
@@ -5817,18 +5919,21 @@ void onTap(int x, int y) {
       blLevel = 0;
       applyBl();
       savePrefs();
+      paintWash = true;
       paintChrome = true;
       drawSet();
     } else if (hit(x, y, 320, 148, 460, 192)) {
       blLevel = 1;
       applyBl();
       savePrefs();
+      paintWash = true;
       paintChrome = true;
       drawSet();
     } else if (hit(x, y, 480, 148, 660, 192)) {
       blLevel = 2;
       applyBl();
       savePrefs();
+      paintWash = true;
       paintChrome = true;
       drawSet();
     } else if (hit(x, y, 668, 148, 788, 192)) {
@@ -6018,23 +6123,8 @@ void onTap(int x, int y) {
   }
   if (hit(x, y, 8, 436, 260, 472)) {
     savePrefs();
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.begin(wifiSsid, wifiPass);
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 12000) delay(50);
-    wifiOk = WiFi.status() == WL_CONNECTED;
-    if (wifiOk) {
-      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-      applyPlaceTz();
-      drawHome();
-      if (placeSet) askNet(NET_PACK);
-    } else {
-      strlcpy(wifiMsg, "no join", sizeof(wifiMsg));
-      paintChrome = true;
-      drawWifi();
-    }
-    eatTouch = true;
+    delay(200);
+    ESP.restart();
     return;
   }
   if (hit(x, y, 274, 436, 526, 472)) {
@@ -6110,6 +6200,9 @@ void connectWifi() {
   loadPrefs();
   if (!wifiSsid[0]) {
     drawWifi();
+    lcdResetPulse();
+    lcdResetPulse();
+    drawWifi();
     return;
   }
   gfx->fillScreen(COL_BG);
@@ -6122,6 +6215,8 @@ void connectWifi() {
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(50);
   wifiOk = WiFi.status() == WL_CONNECTED;
+  lcdResetPulse();
+  lcdResetPulse();
   drawHome();
   if (!wifiOk) return;
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -6145,9 +6240,6 @@ void setup() {
     Serial.println("gfx begin failed");
     return;
   }
-  delay(10);
-  ch422Bit(EXIO_LCD_RST, true);
-  delay(120);
   gfx->setTextWrap(false);
   cols();
   applyBl();
@@ -6166,6 +6258,11 @@ void loop() {
   } else if (nTouch == 1 && millis() - lastTap > 160) {
     lastTap = millis();
     onTap(x, y);
+  }
+  if (wxPaint) {
+    wxPaint = false;
+    if (page == PG_HOME) drawHome();
+    else if (page == PG_DAYS) drawDays();
   }
   takeNetResult();
   if (onQuietPage()) {
